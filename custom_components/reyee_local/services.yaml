@@ -4,6 +4,13 @@ deep_probe:
     Sweeps the router's local API and posts the raw responses as a notification.
     Diagnostic tool for discovering what your firmware exposes.
 
+discover_modules:
+  name: Discover router modules
+  description: >
+    Downloads the router's eWeb JavaScript, lists every API module it uses and
+    probes each one read-only. Results go to /config/reyee_discovery.json and
+    /config/reyee_discovery.md.
+
 set_primary_wan:
   name: Set primary WAN
   description: >

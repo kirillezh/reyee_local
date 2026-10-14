@@ -12,6 +12,7 @@ from .const import DOMAIN, PLATFORMS, CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from .api import ReyeeLocalAPI
 from .coordinator import ReyeeCoordinator
 from .diagnostics_probe import run_deep_probe
+from .discovery import run_discovery
 from .subentries import NETWORK, ensure_subentries, migrate_devices, subentry_id
 
 _LOGGER = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for coord in _coords():
             await run_deep_probe(hass, coord)
 
+    async def _discover_modules(call: ServiceCall):
+        for coord in _coords():
+            await run_discovery(hass, coord)
+
     async def _set_primary_wan(call: ServiceCall):
         ifname = call.data["ifname"]
         for coord in _coords():
@@ -130,6 +135,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not hass.services.has_service(DOMAIN, "deep_probe"):
         hass.services.async_register(DOMAIN, "deep_probe", _deep_probe)
+        hass.services.async_register(DOMAIN, "discover_modules", _discover_modules)
         hass.services.async_register(
             DOMAIN, "set_primary_wan", _set_primary_wan,
             schema=vol.Schema({vol.Required("ifname"): cv.string}),
@@ -194,7 +200,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unloaded:
         hass.data[DOMAIN].pop(entry.entry_id, None)
         if not hass.data[DOMAIN]:
-            for svc in ("deep_probe", "set_primary_wan", "set_forced_switch",
+            for svc in ("deep_probe", "discover_modules", "set_primary_wan", "set_forced_switch",
                         "add_port_forward", "remove_port_forward", "set_ssid",
                         "block_device", "unblock_device", "set_rate_limit"):
                 hass.services.async_remove(DOMAIN, svc)
