@@ -64,7 +64,7 @@ MAX_FETCHES = 4000
 SNIPPET = 260
 
 
-async def _fetch_text(session, url, timeout=15, headers=None):
+async def _fetch_text(session, url, timeout=8, headers=None):
     try:
         async with async_timeout.timeout(timeout):
             async with session.get(url, ssl=False, headers=headers) as resp:
@@ -159,7 +159,9 @@ async def _collect_js(api, session):
     prefixes = set()
     runtime_dump = {}
     attempts = 0
-    while queue and len(files) < MAX_JS_FILES and attempts < MAX_FETCHES:
+    crawl_end = asyncio.get_running_loop().time() + 240   # 4 min max crawling
+    while queue and len(files) < MAX_JS_FILES and attempts < MAX_FETCHES \
+            and asyncio.get_running_loop().time() < crawl_end:
         attempts += 1
         url = queue.pop(0)
         text = await _fetch_text(session, url, headers=hdrs)
@@ -282,9 +284,32 @@ def _classify(body):
     return "data", data
 
 
+CALL_TIMEOUT = 6          # seconds per probe call
+DEVICE_BUDGET = 360       # max seconds probing one device (6 min)
+MAX_STRIKES = 4           # timeouts before a getter is dropped for this device
+
+
 async def _probe(api, modules):
     sem = asyncio.Semaphore(4)
     results = {}
+    strikes = {g: 0 for g in GETTERS}
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + DEVICE_BUDGET
+
+    async def call(method, name, data, no_parse):
+        if strikes[method] >= MAX_STRIKES:
+            return {"_error": "getter not answered by this device — skipped"}
+        try:
+            body = await asyncio.wait_for(
+                api.raw_cmd(method, name, data=data, no_parse=no_parse), CALL_TIMEOUT)
+        except asyncio.TimeoutError:
+            body = {"_error": "timeout"}
+        if isinstance(body, dict) and "_error" in body and \
+                "timeout" in str(body["_error"]).lower():
+            strikes[method] += 1
+        elif strikes[method] < MAX_STRIKES:
+            strikes[method] = 0
+        return body
 
     async def one(name, rec):
         if _DENY_RE.search(name):
@@ -306,7 +331,11 @@ async def _probe(api, modules):
                     variants.append(({"groupId": "0"}, False))
                 variants += [(dv, True) for dv in rec.get("data_variants", [])]
                 for data, no_parse in variants:
-                    body = await api.raw_cmd(method, name, data=data, no_parse=no_parse)
+                    if loop.time() > deadline:
+                        out["_note"] = "time budget reached — not probed"
+                        results[name] = out
+                        return
+                    body = await call(method, name, data, no_parse)
                     kind, payload = _classify(body)
                     if kind == "data":
                         out[method] = {"noParse": no_parse, "request_data": data,
@@ -314,6 +343,8 @@ async def _probe(api, modules):
                         break
                     out.setdefault(method, {"result": kind,
                                             "detail": str(payload)[:300]})
+                    if kind == "error" and "skipped" in str(payload):
+                        break
         results[name] = out
 
     await asyncio.gather(*(one(n, r) for n, r in modules.items()))
@@ -424,25 +455,134 @@ async def run_discovery(hass, coordinator, api=None):
                  len(files), len(modules), len(with_data))
 
 
-async def run_switch_scan(hass, coordinator):
-    """Scan every managed switch the gateway knows about, one after another."""
-    from .api import ReyeeLocalAPI  # local import: avoid cycle at load time
+# Switch modules seen in the switch eWeb (NBS3100 scan) that the gateway's
+# own UI reads through itself with remoteIp=<switch ip>. Read-only getters.
+SWITCH_MODULES = (
+    "sysinfo", "rg_switch", "summaryInfo", "esw", "linkup",
+    "port_base", "port_info", "port_phy", "port_show", "port_vlan", "port_status",
+    "poe", "poe_global", "poe_port", "power_monitor",
+    "vlan", "vlan_port", "l3_interface_info", "subNetVlan",
+    "show_mac", "dynamic_mac", "static_mac", "mac_agetime", "filter_mac",
+    "lldp", "lldp_port", "stp", "stpPort", "mstp", "mstpPortStatus", "mstpInfo",
+    "rldp", "rldp_port", "rldp_port_status",
+    "rate_limit", "storm", "mirror", "isolation", "protected",
+    "aggregate_port", "lacp", "lacp_info", "lacp_port",
+    "igmpCtl", "igmp_snp_vlan", "show_igmp_snp_vlan", "l2_multicast_base",
+    "dhcp_snooping", "dhcp_snp_bind_tbl", "swQos", "swQosPort",
+    "devStaLed", "timeReboot", "syslog", "fanout", "voice_vlan", "ipmac_bind_sta",
+)
 
+
+async def _relay_probe(api, ip):
+    """Read each switch module through the gateway (remoteIp relay)."""
+    out = {}
+    strikes = 0
+    for mod in SWITCH_MODULES:
+        res = {}
+        for method in ("devSta.get", "devConfig.get"):
+            for no_parse in (True, False):
+                if strikes >= 6:
+                    res[method] = {"result": "error", "detail": "relay not answering — stopped"}
+                    break
+                try:
+                    body = await asyncio.wait_for(api.raw_cmd(
+                        method, mod, no_parse=no_parse, extra={"remoteIp": ip}), CALL_TIMEOUT)
+                except asyncio.TimeoutError:
+                    body = {"_error": "timeout"}
+                if isinstance(body, dict) and "timeout" in str(body.get("_error", "")).lower():
+                    strikes += 1
+                else:
+                    strikes = 0
+                kind, payload = _classify(body)
+                if kind == "data":
+                    res[method] = {"noParse": no_parse, "data": payload}
+                    break
+                res.setdefault(method, {"result": kind, "detail": str(payload)[:300]})
+            if method in res and "data" in res[method]:
+                break   # one good read per module is enough
+        out[mod] = res
+    return out
+
+
+# ES-series (ISES) switches: the gateway relays HTTP CGI calls via module "esw".
+# GET-only paths — the first five are taken from the gateway eWeb, the rest
+# are likely names for PoE/system pages (a wrong guess just returns nothing).
+ESW_GET_URLS = (
+    "rest_get_panel.cgi", "rest_get_port.cgi", "rest_get_vlan_list.cgi",
+    "rest_get_vlan_mode.cgi", "rest_get_vlan_multiple.cgi",
+    "rest_get_poe.cgi", "rest_get_poe_port.cgi", "rest_get_poe_info.cgi",
+    "rest_get_poe_status.cgi", "rest_get_poe_global.cgi",
+    "rest_get_sysinfo.cgi", "rest_get_system.cgi", "rest_get_device.cgi",
+    "rest_get_loop.cgi", "rest_get_dhcpsnoop.cgi", "rest_get_storm.cgi",
+    "rest_get_mac.cgi", "rest_get_port_statistic.cgi", "rest_get_port_stat.cgi",
+    "rest_get_led.cgi", "rest_get_hostname.cgi",
+    "poe.cgi", "poe_p.cgi", "loop.cgi", "dhcpsnoop.cgi",
+)
+
+
+async def _esw_probe(api, ip, sn):
+    out, strikes = {}, 0
+    for url in ESW_GET_URLS:
+        hdr = {"ip": ip, "sn": sn, "url": url, "method": "get"}
+        res = {}
+        for label, method, data, extra in (
+                ("params", "devSta.get", None, hdr),
+                ("data", "devSta.get", hdr, None),
+                ("params_cfg", "devConfig.get", None, hdr)):
+            if strikes >= 6:
+                res[label] = {"result": "error", "detail": "relay not answering — stopped"}
+                break
+            try:
+                body = await asyncio.wait_for(api.raw_cmd(
+                    method, "esw", data=data, no_parse=True, extra=extra), CALL_TIMEOUT)
+            except asyncio.TimeoutError:
+                body = {"_error": "timeout"}
+            strikes = strikes + 1 if "timeout" in str(
+                body.get("_error", "") if isinstance(body, dict) else "").lower() else 0
+            kind, payload = _classify(body)
+            if kind == "data":
+                res[label] = {"data": payload}
+                break
+            res[label] = {"result": kind, "detail": str(payload)[:300]}
+        out[url] = res
+    return out
+
+
+async def run_switch_scan(hass, coordinator):
+    """Read every managed switch through the gateway — one file, read-only."""
+    api = coordinator.api
+    nid = "reyee_switch_scan"
     await coordinator._read_slow()          # fresh neighbour list
     targets = coordinator.switch_targets()
     if not targets:
         async_create(hass, "No managed switches found on the network.",
-                     title="Reyee Switch Scan", notification_id="reyee_switch_scan")
+                     title="Reyee Switch Scan", notification_id=nid)
         return
-    async_create(hass, "Scanning switches: " + ", ".join(
-        f"{ip} ({m})" for ip, m in targets.items()) + " — this takes a few minutes each.",
-        title="Reyee Switch Scan", notification_id="reyee_switch_scan")
-    done = []
-    for ip, model in targets.items():
-        api = ReyeeLocalAPI(host=ip, password=coordinator.api.password,
-                            username=coordinator.api.username,
-                            session=coordinator.api.session)
-        await run_discovery(hass, coordinator, api=api)
-        done.append(f"- {ip} ({model}) → `/config/reyee_discovery_{ip.replace('.', '_')}.json`")
-    async_create(hass, "Finished. Send these files back:\n\n" + "\n".join(done),
-                 title="Reyee Switch Scan", notification_id="reyee_switch_scan")
+    if not api.sid:
+        await api.login()
+    report, lines = {"via_gateway": api.host, "switches": {}}, []
+    for i, (ip, model) in enumerate(targets.items(), 1):
+        async_create(hass, f"Reading switch {i} of {len(targets)}: {ip} ({model}) "
+                           "through the router…", title="Reyee Switch Scan",
+                     notification_id=nid)
+        probe = await _relay_probe(api, ip)
+        ok = sorted(m for m, r in probe.items()
+                    if any(isinstance(v, dict) and "data" in v for v in r.values()))
+        entry = {"model": model, "modules_with_data": ok, "probe": probe}
+        if not ok:
+            # ES-series: try the gateway's "esw" CGI relay instead
+            sn = next((n.get("sn") for n in coordinator._slow.get("neighbors", [])
+                       if n.get("ip") == ip), None)
+            esw = await _esw_probe(api, ip, sn)
+            ok = sorted(u for u, r in esw.items()
+                        if any(isinstance(v, dict) and "data" in v for v in r.values()))
+            entry.update({"sn": sn, "esw_probe": esw, "esw_urls_with_data": ok})
+        report["switches"][ip] = entry
+        lines.append(f"- {ip} ({model}): **{len(ok)}** modules answered"
+                     + (f" — {', '.join(ok[:12])}{'…' if len(ok) > 12 else ''}" if ok else ""))
+    path = hass.config.path("reyee_switches.json")
+    await hass.async_add_executor_job(
+        _write, path, json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    async_create(hass, "Done.\n\n" + "\n".join(lines) +
+                 "\n\nSend back **one file**: `/config/reyee_switches.json`",
+                 title="Reyee Switch Scan", notification_id=nid)

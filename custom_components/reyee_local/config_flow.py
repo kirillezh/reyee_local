@@ -7,6 +7,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import (DOMAIN, CONF_HOST, CONF_USERNAME, CONF_PASSWORD,
                     CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
 from .api import ReyeeLocalAPI, ReyeeAuthError, ReyeeConnError
+from .switch_hub import KIND_SWITCH, gateway_knows_switch, probe_direct
 
 
 class ReyeeLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -23,6 +24,8 @@ class ReyeeLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 username=user_input.get(CONF_USERNAME, "admin"),
                 session=async_get_clientsession(self.hass),
             )
+            host = user_input[CONF_HOST]
+            known_switch = gateway_knows_switch(self.hass, host)
             try:
                 await api.login()
             except ReyeeAuthError:
@@ -31,10 +34,22 @@ class ReyeeLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
             except Exception:
                 errors["base"] = "unknown"
-            else:
+
+            info = await probe_direct(api) if not errors else None
+            is_switch = bool(known_switch) or bool(info and (
+                str(info.get("productType", "")).lower() in ("msw", "esw", "sw")
+                or str(info.get("forwardMode", "")).upper() == "SWITCH"))
+
+            if is_switch and (not errors or known_switch):
+                # A switch: added even if it refuses a direct login, as long as
+                # the gateway entry knows it (it's then read through the router).
+                model = (info or {}).get("model") or (known_switch or {}).get("model") or "Switch"
                 return self.async_create_entry(
-                    title=f"Reyee {user_input[CONF_HOST]}", data=user_input
+                    title=f"{host} Reyee {model}",
+                    data={**user_input, "kind": KIND_SWITCH},
                 )
+            if not errors:
+                return self.async_create_entry(title=f"Reyee {host}", data=user_input)
 
         return self.async_show_form(
             step_id="user",

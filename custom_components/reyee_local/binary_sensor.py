@@ -8,6 +8,7 @@ from homeassistant.helpers.device_registry import DeviceInfo, CONNECTION_NETWORK
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
+from .switch_hub import is_switch_entry, async_setup_platform_for_switch
 from .subentries import NETWORK, bind
 from .coordinator import VPN_SERVERS
 
@@ -21,6 +22,8 @@ _INFRA_TYPES = {
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
+    if is_switch_entry(entry):
+        return await async_setup_platform_for_switch(hass, entry, async_add_entities, "binary_sensor")
     async_add_entities = bind(entry, async_add_entities, NETWORK)
     coordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([ReyeeInternetOnline(coordinator, entry)])
@@ -42,6 +45,22 @@ async def async_setup_entry(hass, entry, async_add_entities):
             async_add_entities(new)
 
     _add_infra()
+
+    seen_ports = set()
+
+    def _add_ports():
+        new = []
+        for sn, sw in (coordinator.data or {}).get("switches", {}).items():
+            for p in sw.get("ports", []):
+                key = (sn, p.get("lpid"))
+                if key not in seen_ports:
+                    seen_ports.add(key)
+                    new.append(ReyeeSwitchPort(coordinator, entry, sn, p.get("lpid")))
+        if new:
+            async_add_entities(new)
+
+    _add_ports()
+    entry.async_on_unload(coordinator.async_add_listener(_add_ports))
     entry.async_on_unload(coordinator.async_add_listener(_add_infra))
 
 
@@ -151,3 +170,61 @@ class ReyeeVpnServer(CoordinatorEntity, BinarySensorEntity):
     @property
     def is_on(self):
         return bool((self.coordinator.data or {}).get("vpn", {}).get(self._key))
+
+
+class ReyeeSwitchPort(CoordinatorEntity, BinarySensorEntity):
+    """Link state of one port on a managed switch (read through the gateway)."""
+    _attr_has_entity_name = True
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(self, coordinator, entry, sn, lpid):
+        super().__init__(coordinator)
+        self._sn, self._lpid = sn, lpid
+        sw = (coordinator.data or {}).get("switches", {}).get(sn, {})
+        port = self._port() or {}
+        self._attr_name = f"Port {port.get('name') or lpid}"
+        self._attr_unique_id = f"{entry.entry_id}_swport_{sn}_{lpid}"
+        info = {
+            "identifiers": {(DOMAIN, f"{entry.entry_id}_infra_{sn}")},
+            "manufacturer": "Ruijie",
+            "model": sw.get("model"),
+            "via_device": (DOMAIN, entry.entry_id),
+        }
+        if sw.get("ip"):
+            info["configuration_url"] = f"http://{sw['ip']}"
+        self._attr_device_info = DeviceInfo(**info)
+
+    def _port(self):
+        sw = (self.coordinator.data or {}).get("switches", {}).get(self._sn, {})
+        for p in sw.get("ports", []):
+            if p.get("lpid") == self._lpid:
+                return p
+        return None
+
+    @property
+    def available(self):
+        return super().available and self._port() is not None
+
+    @property
+    def is_on(self):
+        p = self._port()
+        return bool(p and p.get("link"))
+
+    @property
+    def icon(self):
+        return "mdi:ethernet" if self.is_on else "mdi:ethernet-off"
+
+    @property
+    def extra_state_attributes(self):
+        p = self._port() or {}
+        return {
+            "speed": p.get("speed"),
+            "description": p.get("description") or None,
+            "pvid": p.get("pvid"),
+            "vlans": p.get("vlans") or None,
+            "rx_rate": p.get("rx_rate"),
+            "tx_rate": p.get("tx_rate"),
+            "rx_bytes": p.get("rx_bytes"),
+            "tx_bytes": p.get("tx_bytes"),
+            "crc_errors": p.get("crc_errors"),
+        }

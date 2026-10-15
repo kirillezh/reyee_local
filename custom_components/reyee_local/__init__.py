@@ -14,11 +14,30 @@ from .coordinator import ReyeeCoordinator
 from .diagnostics_probe import run_deep_probe
 from .discovery import run_discovery
 from .subentries import NETWORK, ensure_subentries, migrate_devices, subentry_id
+from .switch_hub import SwitchCoordinator, SWITCH_PLATFORMS, is_switch_entry
 
 _LOGGER = logging.getLogger(__name__)
 
 
+async def _async_setup_switch(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """A managed switch added as its own hub entry."""
+    api = ReyeeLocalAPI(
+        host=entry.data[CONF_HOST],
+        password=entry.data.get(CONF_PASSWORD, ""),
+        username=entry.data.get(CONF_USERNAME, "admin"),
+        session=async_get_clientsession(hass),
+    )
+    coordinator = SwitchCoordinator(hass, entry, api)
+    await coordinator.async_config_entry_first_refresh()
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, SWITCH_PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    if is_switch_entry(entry):
+        return await _async_setup_switch(hass, entry)
     api = ReyeeLocalAPI(
         host=entry.data[CONF_HOST],
         password=entry.data[CONF_PASSWORD],
@@ -215,10 +234,11 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    platforms = SWITCH_PLATFORMS if is_switch_entry(entry) else PLATFORMS
+    unloaded = await hass.config_entries.async_unload_platforms(entry, platforms)
     if unloaded:
         hass.data[DOMAIN].pop(entry.entry_id, None)
-        if not hass.data[DOMAIN]:
+        if not any(isinstance(c, ReyeeCoordinator) for c in hass.data[DOMAIN].values()):
             for svc in ("deep_probe", "discover_modules", "set_primary_wan", "set_forced_switch",
                         "add_port_forward", "remove_port_forward", "set_ssid",
                         "block_device", "unblock_device", "set_rate_limit"):
