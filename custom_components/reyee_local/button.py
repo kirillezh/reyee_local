@@ -8,7 +8,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .subentries import NETWORK, bind
 from .diagnostics_probe import run_deep_probe
-from .discovery import run_discovery
+from .discovery import run_discovery, run_switch_scan
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
         ReyeeRefreshButton(coordinator, entry),
         ReyeeProbeButton(coordinator, entry),
         ReyeeDiscoverButton(coordinator, entry),
+        ReyeeScanSwitchesButton(coordinator, entry),
     ])
 
 
@@ -71,3 +72,17 @@ class ReyeeDiscoverButton(CoordinatorEntity, ButtonEntity):
 
     async def async_press(self):
         self.hass.async_create_task(run_discovery(self.hass, self.coordinator))
+
+
+class ReyeeScanSwitchesButton(CoordinatorEntity, ButtonEntity):
+    """Find every managed switch on the network and scan each one (read-only)."""
+    _attr_name = "Reyee Scan Switches"
+    _attr_icon = "mdi:switch"
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_scan_switches"
+        self._attr_device_info = _dev(entry)
+
+    async def async_press(self):
+        self.hass.async_create_task(run_switch_scan(self.hass, self.coordinator))

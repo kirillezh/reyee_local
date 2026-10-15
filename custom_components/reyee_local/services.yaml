@@ -9,7 +9,29 @@ discover_modules:
   description: >
     Downloads the router's eWeb JavaScript, lists every API module it uses and
     probes each one read-only. Results go to /config/reyee_discovery.json and
-    /config/reyee_discovery.md.
+    /config/reyee_discovery.md. Give a host to scan a managed switch or AP
+    instead (results go to reyee_discovery_<ip>.json).
+  fields:
+    host:
+      name: Device IP (optional)
+      description: IP of a Reyee switch/AP to scan. Leave empty for the gateway.
+      required: false
+      example: 192.168.88.14
+      selector:
+        text:
+    username:
+      name: Username (optional)
+      description: Defaults to the gateway's username.
+      required: false
+      selector:
+        text:
+    password:
+      name: Password (optional)
+      description: Defaults to the gateway's password (Reyee networks usually share one).
+      required: false
+      selector:
+        text:
+          type: password
 
 set_primary_wan:
   name: Set primary WAN

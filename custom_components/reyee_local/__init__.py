@@ -83,8 +83,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await run_deep_probe(hass, coord)
 
     async def _discover_modules(call: ServiceCall):
+        host = call.data.get("host")
         for coord in _coords():
-            await run_discovery(hass, coord)
+            if not host:
+                await run_discovery(hass, coord)
+                continue
+            # Scan another Reyee device (managed switch / AP) directly.
+            other = ReyeeLocalAPI(
+                host=host,
+                password=call.data.get("password") or coord.api.password,
+                username=call.data.get("username") or coord.api.username,
+                session=async_get_clientsession(hass),
+            )
+            await run_discovery(hass, coord, api=other)
+            break
 
     async def _set_primary_wan(call: ServiceCall):
         ifname = call.data["ifname"]
@@ -135,7 +147,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not hass.services.has_service(DOMAIN, "deep_probe"):
         hass.services.async_register(DOMAIN, "deep_probe", _deep_probe)
-        hass.services.async_register(DOMAIN, "discover_modules", _discover_modules)
+        hass.services.async_register(
+            DOMAIN, "discover_modules", _discover_modules,
+            schema=vol.Schema({
+                vol.Optional("host"): cv.string,
+                vol.Optional("username"): cv.string,
+                vol.Optional("password"): cv.string,
+            }),
+        )
         hass.services.async_register(
             DOMAIN, "set_primary_wan", _set_primary_wan,
             schema=vol.Schema({vol.Required("ifname"): cv.string}),

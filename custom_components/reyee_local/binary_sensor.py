@@ -9,6 +9,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .subentries import NETWORK, bind
+from .coordinator import VPN_SERVERS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -23,6 +24,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities = bind(entry, async_add_entities, NETWORK)
     coordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([ReyeeInternetOnline(coordinator, entry)])
+    async_add_entities([ReyeeVpnServer(coordinator, entry, key, name)
+                        for key, name in VPN_SERVERS])
 
     seen = set()
 
@@ -123,3 +126,28 @@ class ReyeeInfraDevice(CoordinatorEntity, BinarySensorEntity):
             "serial": n.get("sn"),
             "uplink_port": n.get("uplink_port"),
         }
+
+
+class ReyeeVpnServer(CoordinatorEntity, BinarySensorEntity):
+    """Whether a VPN server (OpenVPN / L2TP / PPTP) is enabled on the gateway."""
+    _attr_icon = "mdi:vpn"
+
+    def __init__(self, coordinator, entry, key, name):
+        super().__init__(coordinator)
+        self._key = key
+        self._attr_name = f"Reyee {name}"
+        self._attr_unique_id = f"{entry.entry_id}_vpn_{key}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            manufacturer="Ruijie",
+            name=entry.title,
+            configuration_url=f"http://{entry.data['host']}",
+        )
+
+    @property
+    def available(self):
+        return super().available and self._key in (self.coordinator.data or {}).get("vpn", {})
+
+    @property
+    def is_on(self):
+        return bool((self.coordinator.data or {}).get("vpn", {}).get(self._key))
