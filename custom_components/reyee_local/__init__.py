@@ -19,6 +19,50 @@ from .switch_hub import SwitchCoordinator, SWITCH_PLATFORMS, is_switch_entry
 _LOGGER = logging.getLogger(__name__)
 
 
+def _switch_by_host(hass, host):
+    from homeassistant.exceptions import HomeAssistantError
+    for c in hass.data.get(DOMAIN, {}).values():
+        if isinstance(c, SwitchCoordinator) and c.host == host:
+            return c
+    raise HomeAssistantError(f"No Reyee switch entry for {host}")
+
+
+def _register_switch_services(hass):
+    if hass.services.has_service(DOMAIN, "set_port_description"):
+        return
+    base = {vol.Required("switch_ip"): cv.string, vol.Required("port"): cv.string}
+
+    async def _desc(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_set_port_description(
+            call.data["port"], call.data.get("description", ""))
+
+    async def _vlan(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_set_port_vlan(
+            call.data["port"], call.data["mode"], call.data["pvid"],
+            call.data.get("permit_vlans", ""), call.data.get("untag_vlans", ""))
+
+    async def _iso(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_set_port_isolation(
+            call.data["port"], call.data["enabled"])
+
+    async def _rate(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_set_port_rate_limit(
+            call.data["port"], call.data.get("in_kbps", 0), call.data.get("out_kbps", 0))
+
+    hass.services.async_register(DOMAIN, "set_port_description", _desc, schema=vol.Schema({
+        **base, vol.Optional("description", default=""): cv.string}))
+    hass.services.async_register(DOMAIN, "set_port_vlan", _vlan, schema=vol.Schema({
+        **base, vol.Required("mode"): vol.In(["access", "trunk", "hybrid"]),
+        vol.Required("pvid"): vol.Coerce(int),
+        vol.Optional("permit_vlans", default=""): cv.string,
+        vol.Optional("untag_vlans", default=""): cv.string}))
+    hass.services.async_register(DOMAIN, "set_port_isolation", _iso, schema=vol.Schema({
+        **base, vol.Required("enabled"): cv.boolean}))
+    hass.services.async_register(DOMAIN, "set_port_rate_limit", _rate, schema=vol.Schema({
+        **base, vol.Optional("in_kbps", default=0): vol.Coerce(int),
+        vol.Optional("out_kbps", default=0): vol.Coerce(int)}))
+
+
 async def _async_setup_switch(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """A managed switch added as its own hub entry."""
     api = ReyeeLocalAPI(
@@ -30,6 +74,7 @@ async def _async_setup_switch(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = SwitchCoordinator(hass, entry, api)
     await coordinator.async_config_entry_first_refresh()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    _register_switch_services(hass)
     await hass.config_entries.async_forward_entry_setups(entry, SWITCH_PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True

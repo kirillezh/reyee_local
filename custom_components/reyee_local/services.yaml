@@ -194,3 +194,41 @@ set_rate_limit:
           min: 0
           max: 1000000
           mode: box
+
+set_port_description:
+  name: Switch — set port description
+  description: Set the description of a port on a managed switch entry.
+  fields:
+    switch_ip: {name: Switch IP, required: true, example: 192.168.88.162, selector: {text: {}}}
+    port: {name: Port, description: "Port name, e.g. Gi7", required: true, example: Gi7, selector: {text: {}}}
+    description: {name: Description, example: Patio AP, selector: {text: {}}}
+
+set_port_vlan:
+  name: Switch — set port VLAN
+  description: >
+    Set a port's VLAN mode. access = one VLAN (pvid). trunk = native pvid +
+    allowed VLANs. The uplink port is refused.
+  fields:
+    switch_ip: {name: Switch IP, required: true, example: 192.168.88.162, selector: {text: {}}}
+    port: {name: Port, required: true, example: Gi7, selector: {text: {}}}
+    mode: {name: Mode, required: true, selector: {select: {options: [access, trunk, hybrid]}}}
+    pvid: {name: Native / access VLAN, required: true, example: 30, selector: {number: {min: 1, max: 4094, mode: box}}}
+    permit_vlans: {name: Allowed VLANs (trunk), example: "1,20,30,89", selector: {text: {}}}
+    untag_vlans: {name: Untagged VLANs (hybrid), selector: {text: {}}}
+
+set_port_isolation:
+  name: Switch — port isolation
+  description: Isolated ports can't talk to each other, only to non-isolated ports (e.g. the uplink).
+  fields:
+    switch_ip: {name: Switch IP, required: true, example: 192.168.88.162, selector: {text: {}}}
+    port: {name: Port, required: true, example: Gi7, selector: {text: {}}}
+    enabled: {name: Isolated, required: true, selector: {boolean: {}}}
+
+set_port_rate_limit:
+  name: Switch — port bandwidth limit
+  description: Limit a port's speed in kbps. Set both to 0 to remove the limit.
+  fields:
+    switch_ip: {name: Switch IP, required: true, example: 192.168.88.162, selector: {text: {}}}
+    port: {name: Port, required: true, example: Gi7, selector: {text: {}}}
+    in_kbps: {name: Inbound limit (kbps), example: 10000, selector: {number: {min: 0, max: 1000000, mode: box}}}
+    out_kbps: {name: Outbound limit (kbps), example: 10000, selector: {number: {min: 0, max: 1000000, mode: box}}}
