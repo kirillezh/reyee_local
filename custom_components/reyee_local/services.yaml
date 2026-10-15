@@ -232,3 +232,18 @@ set_port_rate_limit:
     port: {name: Port, required: true, example: Gi7, selector: {text: {}}}
     in_kbps: {name: Inbound limit (kbps), example: 10000, selector: {number: {min: 0, max: 1000000, mode: box}}}
     out_kbps: {name: Outbound limit (kbps), example: 10000, selector: {number: {min: 0, max: 1000000, mode: box}}}
+
+create_vlan:
+  name: Switch — create VLAN
+  description: Create a VLAN on a managed switch entry.
+  fields:
+    switch_ip: {name: Switch IP, required: true, example: 192.168.88.162, selector: {text: {}}}
+    vlan_id: {name: VLAN ID, required: true, example: 40, selector: {number: {min: 2, max: 4094, mode: box}}}
+    name: {name: Name, example: IOT VLAN, selector: {text: {}}}
+
+delete_vlan:
+  name: Switch — delete VLAN
+  description: Delete a VLAN from a managed switch entry (VLAN 1 can't be deleted).
+  fields:
+    switch_ip: {name: Switch IP, required: true, example: 192.168.88.162, selector: {text: {}}}
+    vlan_id: {name: VLAN ID, required: true, example: 40, selector: {number: {min: 2, max: 4094, mode: box}}}

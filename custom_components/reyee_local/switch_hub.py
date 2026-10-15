@@ -13,7 +13,9 @@ from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass, BinarySensorEntity)
 from homeassistant.components.button import ButtonEntity
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
+from homeassistant.components.select import SelectEntity
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.components.text import TextEntity
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.const import EntityCategory
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -25,7 +27,18 @@ from .const import DOMAIN, CONF_HOST, CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
 _LOGGER = logging.getLogger(__name__)
 
 KIND_SWITCH = "switch"
-SWITCH_PLATFORMS = ["binary_sensor", "sensor", "button", "switch"]
+SWITCH_PLATFORMS = ["binary_sensor", "sensor", "button", "switch", "select", "text"]
+
+# Switch-wide on/off settings: key, module, field, on, off, name, icon
+GLOBALS = (
+    ("rldp", "rldp", "enable", 1, 0, "Loop Detection", "mdi:sync-alert"),
+    ("stp", "stp", "enable", 1, 0, "Spanning Tree", "mdi:graph-outline"),
+    ("lldp", "lldp", "enable", 1, 0, "LLDP", "mdi:lan-connect"),
+    ("dhcp_snooping", "dhcp_snooping", "enable", 1, 0, "DHCP Snooping", "mdi:shield-lock-outline"),
+    ("igmp_snooping", "l2_multicast_base", "igmp_snp_en", 1, 0, "IGMP Snooping", "mdi:television-play"),
+    ("voice_vlan", "voice_vlan", "enable", "1", "0", "Voice VLAN", "mdi:phone-voip"),
+)
+_STAMPS = ("version", "configId", "configTime", "currentTime")
 _TIMEOUT = 8
 
 
@@ -132,7 +145,8 @@ class SwitchCoordinator(DataUpdateCoordinator):
         self.sysinfo = {}
         self._desc = {}
         self._poll = 0
-        self._slowcache = {"protected": {}, "macs": {}}
+        self._slowcache = {"protected": {}, "macs": {}, "vlans": [], "port_vlan": {},
+                           "globals": {}}
 
     # ── transport ────────────────────────────────────────────────────────
     def _gateway(self):
@@ -176,10 +190,10 @@ class SwitchCoordinator(DataUpdateCoordinator):
         except Exception as err:  # noqa: BLE001
             return {"_error": str(err)}
 
-    async def _write(self, module, data):
-        """Config write: devConfig.update, falling back to devConfig.set."""
+    async def _write(self, module, data, order=("devConfig.update", "devConfig.set")):
+        """Config write in the eWeb's format; tries the methods in `order`."""
         last = None
-        for method in ("devConfig.update", "devConfig.set"):
+        for method in order:
             last = await self._raw(method, module, data=data)
             if _write_ok(last):
                 return method
@@ -220,6 +234,52 @@ class SwitchCoordinator(DataUpdateCoordinator):
         if row is None:
             raise HomeAssistantError("Couldn't read port settings")
         await self._write("port_phy", {"data": [{**row, "description": description[:32]}]})
+        self._poll = 0
+        await self.async_request_refresh()
+
+    async def async_set_global(self, key, on):
+        spec = next(g for g in GLOBALS if g[0] == key)
+        _k, module, field, on_v, off_v, _n, _i = spec
+        cfg = await self._call("devConfig.get", module)
+        if not isinstance(cfg, dict):
+            raise HomeAssistantError(f"Couldn't read {module}")
+        out = {k: v for k, v in cfg.items() if k not in _STAMPS}
+        out[field] = on_v if on else off_v
+        await self._write(module, out, order=("devConfig.set", "devConfig.update"))
+        self._poll = 0
+        await self.async_request_refresh()
+
+    async def async_set_port_pvid(self, lpid, pvid):
+        """Change a port's access VLAN (access port) or native VLAN (trunk)."""
+        p = next((x for x in (self.data or {}).get("ports", []) if x["lpid"] == lpid), None)
+        if p and p["name"] == (self.data or {}).get("uplink"):
+            raise HomeAssistantError("Refusing to change the uplink port's VLAN (would cut the switch off)")
+        cfg = await self._call("devConfig.get", "port_vlan")
+        row = next((r for r in (cfg.get("list", []) if isinstance(cfg, dict) else [])
+                    if r.get("lpid") == lpid), None)
+        if row is None:
+            raise HomeAssistantError(f"Couldn't read VLAN settings for port {lpid}")
+        mode = row.get("mode")
+        permit = row.get("permitvlan", "")
+        if mode == 2 and permit and str(pvid) not in permit.split(","):
+            permit = f"{permit},{pvid}"
+        entry = {"mode": mode, "lpid": lpid, "pvid": str(pvid),
+                 "permitvlan": "" if mode == 1 else permit,
+                 "untagvlan": row.get("untagvlan", "") if mode == 0 else ""}
+        await self._write("port_vlan", {"list": [entry]})
+        self._poll = 0
+        await self.async_request_refresh()
+
+    async def async_create_vlan(self, vlan_id, name=""):
+        await self._write("vlan", {"v": str(int(vlan_id)), "n": name or ""},
+                          order=("devConfig.add", "devConfig.set"))
+        self._poll = 0
+        await self.async_request_refresh()
+
+    async def async_delete_vlan(self, vlan_id):
+        if int(vlan_id) == 1:
+            raise HomeAssistantError("VLAN 1 can't be deleted")
+        await self._write("vlan", {"v": str(int(vlan_id))}, order=("devConfig.del",))
         self._poll = 0
         await self.async_request_refresh()
 
@@ -418,6 +478,23 @@ class SwitchCoordinator(DataUpdateCoordinator):
             rl = await self._call("devSta.get", "rldp_port_status")
             for r in (rl.get("list", []) if isinstance(rl, dict) else []):
                 loops[r.get("lpid")] = r.get("detect_state") not in (0, "0", None)
+            if self._poll % 5 == 1:
+                pv = await self._call("devConfig.get", "port_vlan")
+                if isinstance(pv, dict) and isinstance(pv.get("list"), list):
+                    self._slowcache["port_vlan"] = {r.get("lpid"): r for r in pv["list"]}
+            if self._poll % 10 == 1:
+                vl = await self._call("devConfig.get", "vlan")
+                if isinstance(vl, dict) and isinstance(vl.get("list"), list):
+                    self._slowcache["vlans"] = [
+                        {"id": str(v.get("v")), "name": v.get("n") or f"VLAN{v.get('v')}"}
+                        for v in vl["list"]]
+                g = {}
+                for key, module, field, on_v, _off, _n, _i in GLOBALS:
+                    cfg = await self._call("devConfig.get", module)
+                    if isinstance(cfg, dict) and field in cfg:
+                        g[key] = str(cfg[field]) == str(on_v)
+                if g:
+                    self._slowcache["globals"] = g
             if self._poll % 10 == 1:
                 pr = await self._call("devConfig.get", "protected")
                 rows = pr.get("data") if isinstance(pr, dict) else None
@@ -446,6 +523,8 @@ class SwitchCoordinator(DataUpdateCoordinator):
                 "loop": loops.get(lp, False),
                 "isolated": self._slowcache["protected"].get(lp),
                 "devices": self._slowcache["macs"].get(lp, []),
+                "vlan_mode": {0: "hybrid", 1: "access", 2: "trunk"}.get(
+                    (self._slowcache["port_vlan"].get(lp) or {}).get("mode")),
             })
 
         online = bool(ports) or bool(gw_node)
@@ -463,6 +542,8 @@ class SwitchCoordinator(DataUpdateCoordinator):
             "firmware": self.sysinfo.get("software_version"),
             "ports_supported": isinstance(ps, list),
             "loop_ports": loop_ports,
+            "vlans": self._slowcache["vlans"],
+            "globals": self._slowcache["globals"],
             "crc_total": sum(int(p.get("crc_errors") or 0) for p in ports),
         }
 
@@ -684,6 +765,172 @@ class SwitchPortEnable(_Base, SwitchEntity):
         await self.coordinator.async_set_port_enabled(self._lpid, False)
 
 
+class _PortBase(_Base):
+    def __init__(self, coord, key, lpid, label):
+        super().__init__(coord, f"{key}_{lpid}")
+        self._lpid = lpid
+        self._attr_name = label
+
+    def _port(self):
+        for p in (self.coordinator.data or {}).get("ports", []):
+            if p.get("lpid") == self._lpid:
+                return p
+        return None
+
+    @property
+    def available(self):
+        return super().available and self._port() is not None
+
+
+class SwitchPortVlan(_PortBase, SelectEntity):
+    """Access VLAN (access port) / native VLAN (trunk port)."""
+    _attr_icon = "mdi:lan"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coord, lpid, name):
+        super().__init__(coord, "port_vlan", lpid, f"Port {name} VLAN")
+
+    def _label(self, vid):
+        for v in (self.coordinator.data or {}).get("vlans", []):
+            if v["id"] == str(vid):
+                return f"{v['id']} – {v['name']}"
+        return str(vid)
+
+    @property
+    def options(self):
+        opts = [self._label(v["id"]) for v in (self.coordinator.data or {}).get("vlans", [])]
+        cur = self.current_option
+        if cur and cur not in opts:
+            opts.append(cur)
+        return opts or ["1"]
+
+    @property
+    def current_option(self):
+        p = self._port()
+        return self._label(p.get("pvid")) if p and p.get("pvid") else None
+
+    @property
+    def extra_state_attributes(self):
+        p = self._port() or {}
+        return {"mode": p.get("vlan_mode"), "allowed_vlans": p.get("vlans") or None}
+
+    async def async_select_option(self, option):
+        await self.coordinator.async_set_port_pvid(self._lpid, option.split(" ")[0])
+
+
+class SwitchPortDescription(_PortBase, TextEntity):
+    _attr_icon = "mdi:tag-text-outline"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_native_max = 32
+
+    def __init__(self, coord, lpid, name):
+        super().__init__(coord, "port_desc", lpid, f"Port {name} Description")
+
+    @property
+    def native_value(self):
+        p = self._port()
+        return (p or {}).get("description") or ""
+
+    async def async_set_value(self, value):
+        p = self._port() or {}
+        await self.coordinator.async_set_port_description(p.get("name", self._lpid), value)
+
+
+class SwitchPortIsolated(_PortBase, SwitchEntity):
+    _attr_icon = "mdi:shield-half-full"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coord, lpid, name):
+        super().__init__(coord, "port_iso", lpid, f"Port {name} Isolated")
+
+    @property
+    def is_on(self):
+        return bool((self._port() or {}).get("isolated"))
+
+    async def async_turn_on(self, **kwargs):
+        await self.coordinator.async_set_port_isolation((self._port() or {})["name"], True)
+
+    async def async_turn_off(self, **kwargs):
+        await self.coordinator.async_set_port_isolation((self._port() or {})["name"], False)
+
+
+class SwitchPortValue(_PortBase, SensorEntity):
+    """rx/tx rate, speed or CRC count for one port."""
+
+    def __init__(self, coord, lpid, name, field, label, unit=None, icon=None,
+                 enabled=True, state_class=SensorStateClass.MEASUREMENT, diag=False):
+        super().__init__(coord, f"port_{field}", lpid, f"Port {name} {label}")
+        self._field = field
+        self._attr_native_unit_of_measurement = unit
+        self._attr_icon = icon
+        self._attr_entity_registry_enabled_default = enabled
+        self._attr_state_class = state_class
+        if diag:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def native_value(self):
+        return (self._port() or {}).get(self._field)
+
+
+class SwitchGlobal(_Base, SwitchEntity):
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coord, key, name, icon):
+        super().__init__(coord, f"global_{key}")
+        self._key = key
+        self._attr_name = name
+        self._attr_icon = icon
+
+    @property
+    def available(self):
+        return super().available and self._key in (self.coordinator.data or {}).get("globals", {})
+
+    @property
+    def is_on(self):
+        return bool((self.coordinator.data or {}).get("globals", {}).get(self._key))
+
+    async def async_turn_on(self, **kwargs):
+        await self.coordinator.async_set_global(self._key, True)
+
+    async def async_turn_off(self, **kwargs):
+        await self.coordinator.async_set_global(self._key, False)
+
+
+class SwitchVlans(_Base, SensorEntity):
+    _attr_name = "VLANs"
+    _attr_icon = "mdi:lan"
+
+    def __init__(self, coord):
+        super().__init__(coord, "vlans")
+
+    @property
+    def native_value(self):
+        v = (self.coordinator.data or {}).get("vlans")
+        return len(v) if v else None
+
+    @property
+    def extra_state_attributes(self):
+        return {v["id"]: v["name"] for v in (self.coordinator.data or {}).get("vlans", [])}
+
+
+def _per_port(coord, entry, async_add_entities, factory, skip_ag=True):
+    seen = set()
+
+    def _add():
+        new = []
+        for p in (coord.data or {}).get("ports", []):
+            if p["lpid"] in seen or (skip_ag and p["name"].startswith("Ag")):
+                continue
+            seen.add(p["lpid"])
+            new.extend(factory(p))
+        if new:
+            async_add_entities(new)
+
+    _add()
+    entry.async_on_unload(coord.async_add_listener(_add))
+
+
 async def async_setup_platform_for_switch(hass, entry, async_add_entities, platform):
     coord = hass.data[DOMAIN][entry.entry_id]
     if platform == "binary_sensor":
@@ -702,10 +949,31 @@ async def async_setup_platform_for_switch(hass, entry, async_add_entities, platf
         _add_ports()
         entry.async_on_unload(coord.async_add_listener(_add_ports))
     elif platform == "sensor":
-        async_add_entities([SwitchPortsUp(coord), SwitchUplink(coord), SwitchCrc(coord)])
+        async_add_entities([SwitchPortsUp(coord), SwitchUplink(coord), SwitchCrc(coord),
+                            SwitchVlans(coord)])
+        _per_port(coord, entry, async_add_entities, lambda p: [
+            SwitchPortValue(coord, p["lpid"], p["name"], "rx_rate", "RX Rate", "kbit/s",
+                            "mdi:download-network"),
+            SwitchPortValue(coord, p["lpid"], p["name"], "tx_rate", "TX Rate", "kbit/s",
+                            "mdi:upload-network"),
+            SwitchPortValue(coord, p["lpid"], p["name"], "speed", "Link Speed", None,
+                            "mdi:speedometer", enabled=False, state_class=None, diag=True),
+            SwitchPortValue(coord, p["lpid"], p["name"], "crc_errors", "CRC Errors", None,
+                            "mdi:alert-circle-outline", enabled=False,
+                            state_class=SensorStateClass.TOTAL_INCREASING, diag=True),
+        ])
     elif platform == "button":
         async_add_entities([SwitchRefresh(coord), SwitchReboot(coord)])
+    elif platform == "select":
+        _per_port(coord, entry, async_add_entities,
+                  lambda p: [SwitchPortVlan(coord, p["lpid"], p["name"])])
+    elif platform == "text":
+        _per_port(coord, entry, async_add_entities,
+                  lambda p: [SwitchPortDescription(coord, p["lpid"], p["name"])])
     elif platform == "switch":
+        async_add_entities([SwitchGlobal(coord, k, n, i) for k, _m, _f, _on, _off, n, i in GLOBALS])
+        _per_port(coord, entry, async_add_entities,
+                  lambda p: [SwitchPortIsolated(coord, p["lpid"], p["name"])])
         seen_sw = set()
 
         def _add_enables():

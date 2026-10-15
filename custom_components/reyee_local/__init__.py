@@ -49,6 +49,18 @@ def _register_switch_services(hass):
         await _switch_by_host(hass, call.data["switch_ip"]).async_set_port_rate_limit(
             call.data["port"], call.data.get("in_kbps", 0), call.data.get("out_kbps", 0))
 
+    async def _vadd(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_create_vlan(
+            call.data["vlan_id"], call.data.get("name", ""))
+
+    async def _vdel(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_delete_vlan(call.data["vlan_id"])
+
+    vbase = {vol.Required("switch_ip"): cv.string,
+             vol.Required("vlan_id"): vol.All(vol.Coerce(int), vol.Range(min=1, max=4094))}
+    hass.services.async_register(DOMAIN, "create_vlan", _vadd, schema=vol.Schema({
+        **vbase, vol.Optional("name", default=""): cv.string}))
+    hass.services.async_register(DOMAIN, "delete_vlan", _vdel, schema=vol.Schema(vbase))
     hass.services.async_register(DOMAIN, "set_port_description", _desc, schema=vol.Schema({
         **base, vol.Optional("description", default=""): cv.string}))
     hass.services.async_register(DOMAIN, "set_port_vlan", _vlan, schema=vol.Schema({
