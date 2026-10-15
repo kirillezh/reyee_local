@@ -192,6 +192,32 @@ class ReyeeLocalAPI:
             return {"_error": str(err)}
 
 
+    async def switch_api(self, params, timeout=15, _retry=True):
+        """
+        ES-series switch relay: POST /api/switch {method: doSwitchApi, params}.
+        params = {ip, sn, method: "get"|"post", url: "<cgi>", data?}. This is how
+        the gateway eWeb talks to ES switches (they have no eWeb of their own).
+        """
+        if not self.sid:
+            await self.login()
+        base = self._base or await self._resolve_base()
+        payload = {"id": self._next_id(), "method": "doSwitchApi", "params": params}
+        try:
+            async with async_timeout.timeout(timeout):
+                async with self.session.post(
+                    f"{base}/cgi-bin/luci/api/switch?auth={self.sid}",
+                    json=payload, ssl=False,
+                ) as resp:
+                    body = await resp.json(content_type=None)
+        except asyncio.TimeoutError:
+            return {"_error": "timeout"}
+        except Exception as err:  # noqa: BLE001
+            return {"_error": str(err)}
+        if _retry and isinstance(body, dict) and body.get("code") in (401, 403, "401", "403"):
+            self.sid = None
+            return await self.switch_api(params, timeout, _retry=False)
+        return body
+
     async def set_config(self, module, data, timeout=60):
         """
         Write config (devConfig.set). Confirmed for module=mllb on EG.

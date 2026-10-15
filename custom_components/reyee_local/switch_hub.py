@@ -330,74 +330,197 @@ class SwitchCoordinator(DataUpdateCoordinator):
                 return
         raise HomeAssistantError(f"Reboot not accepted: {str(body)[:200]}")
 
-    # ── ES-series (no eWeb): gateway relays CGI calls via module "esw" ────
-    ES_URLS = ("rest_get_panel.cgi", "rest_get_port.cgi", "rest_get_vlan_list.cgi",
-               "rest_get_vlan_mode.cgi", "rest_get_vlan_multiple.cgi")
+    # ── ES-series (no eWeb): gateway relays CGI calls via /api/switch ────
+    # Taken from the gateway eWeb: switchApi("doSwitchApi", {ip, sn, method, url, data})
+    ES_READS = {
+        "port": "rest_get_port.cgi",
+        "poe": "rest_get_poe_info.cgi",
+        "poe_power": "rest_get_poe_power_info.cgi",
+        "sys_power": "rest_get_sys_power_info.cgi",
+        "info": "rest_get_info.cgi",
+        "panel": "rest_get_panel.cgi",
+    }
 
-    async def _esw(self, url, variant=None):
-        gw = self._gateway()
-        if gw is None:
-            return None, None
-        sn = (gateway_knows_switch(self.hass, self.host) or {}).get("sn")
-        hdr = {"ip": self.host, "sn": sn, "url": url, "method": "get"}
-        shapes = {
-            "params": ("devSta.get", None, hdr),
-            "data": ("devSta.get", hdr, None),
-            "params_cfg": ("devConfig.get", None, hdr),
-            "data_nested": ("devSta.get", {"data": hdr}, None),
-        }
-        order = [variant] if variant else list(shapes)
-        for v in order:
-            method, data, extra = shapes[v]
-            try:
-                r = await asyncio.wait_for(gw.api.raw_cmd(
-                    method, "esw", data=data, no_parse=True, extra=extra), _TIMEOUT)
-            except Exception:  # noqa: BLE001
-                continue
-            r = _peel(r)
-            if not _bad(r):
-                return r, v
-        return None, None
+    def _es_sn(self):
+        return (gateway_knows_switch(self.hass, self.host) or {}).get("sn")
 
-    async def _dump_esw_code(self):
-        """Once per HA start: save how the router's web code talks to ES switches."""
-        flag = self.hass.data.setdefault(DOMAIN + "_esw_code", {"done": False})
-        if flag["done"]:
-            return
-        flag["done"] = True
+    async def _esw(self, url, method="get", data=None):
+        """One doSwitchApi call through the gateway. Returns (ok, payload)."""
         gw = self._gateway()
-        if gw is None:
-            return
-        from .discovery import extract_esw_code
-        try:
-            code = await extract_esw_code(gw.api)
-        except Exception as err:  # noqa: BLE001
-            code = {"error": str(err)}
-        await self.hass.async_add_executor_job(
-            _dump, self.hass.config.path("reyee_es_code.json"), code)
+        if gw is None or not hasattr(gw.api, "switch_api"):
+            return False, "no gateway"
+        params = {"ip": self.host, "sn": self._es_sn(), "method": method, "url": url}
+        if data is not None:
+            params["data"] = data
+        body = await gw.api.switch_api(params)
+        if not isinstance(body, dict):
+            return (body is not None), body
+        if "_error" in body:
+            return False, body["_error"]
+        code = body.get("code")
+        if code not in (0, "0", None):
+            return False, body
+        for key in ("result", "data"):
+            if key in body and body[key] not in (None, ""):
+                return True, _peel(body[key])
+        return True, {k: v for k, v in body.items() if k not in ("id", "code", "error")}
+
+    async def _esw_write(self, url, data=None):
+        ok, res = await self._esw(url, method="post", data=data)
+        if not ok:
+            raise HomeAssistantError(f"Switch {self.host} rejected {url}: {str(res)[:200]}")
+        return res
 
     async def _read_es(self):
-        if not hasattr(self, "_es_variant"):
-            self._es_variant, report = None, {}
-            for url in self.ES_URLS:
-                r, v = await self._esw(url)
-                report[url] = r if r is not None else "no answer"
-                if v and not self._es_variant:
-                    self._es_variant = v
-            self._es_report = report
+        raw = dict(getattr(self, "_es_cache", {}))
+        first = not hasattr(self, "_es_dumped")
+        keys = list(self.ES_READS) if first else ["port", "poe"]
+        for key in keys:
+            ok, res = await self._esw(self.ES_READS[key])
+            raw[key] = res if ok else None
+            if first:
+                raw.setdefault("_errors", {})[key] = None if ok else str(res)[:300]
+        if self._poll % 5 == 0:
+            ok, res = await self._esw("mac.cgi?page=fwd_tbl_json")
+            if ok:
+                raw["mac"] = res
+        self._es_cache = raw
+        if first:
+            self._es_dumped = True
             await self.hass.async_add_executor_job(
-                _dump, self.hass.config.path(
-                    f"reyee_es_{self.host.replace('.', '_')}.json"),
-                {"host": self.host, "variant": str(self._es_variant), "replies": report})
-        if not self._es_variant:
-            self.hass.async_create_task(self._dump_esw_code())
-            return {}
-        out = {}
-        for url in ("rest_get_panel.cgi", "rest_get_port.cgi"):
-            r, _v = await self._esw(url, self._es_variant)
-            if r is not None:
-                out[url] = r
-        return out
+                _dump, self.hass.config.path(f"reyee_es_{self.host.replace('.', '_')}.json"),
+                {"host": self.host, "sn": self._es_sn(), "via": "/api/switch doSwitchApi",
+                 "replies": raw})
+        return raw
+
+    # ES parsing — tolerant: field names are matched from a few likely spellings.
+    @staticmethod
+    def _first(d, keys, default=None):
+        for k in keys:
+            if isinstance(d, dict) and k in d and d[k] not in (None, ""):
+                return d[k]
+        return default
+
+    @staticmethod
+    def _truthy(v):
+        return str(v).strip().lower() in ("1", "true", "on", "up", "enable", "enabled", "yes", "link")
+
+    @staticmethod
+    def _list_in(obj):
+        if isinstance(obj, list):
+            return obj
+        if isinstance(obj, dict):
+            for k in ("list", "ports", "port_list", "portList", "portInfo", "poe_list",
+                      "poeList", "data", "port"):
+                if isinstance(obj.get(k), list):
+                    return obj[k]
+            for v in obj.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    return v
+        return []
+
+    _ES_SPEED = {1: "10M half", 2: "10M", 3: "100M half", 4: "100M", 5: "1000M", 6: "2.5G",
+                 7: "10G"}
+
+    @staticmethod
+    def _num(v, div=1, nd=1):
+        try:
+            return round(float(v) / div, nd)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_es(self, raw):
+        """Parse the ES switch replies (field names confirmed on ES205GC-P / ES220GS-P)."""
+        poe_raw = raw.get("poe") if isinstance(raw.get("poe"), dict) else {}
+        poe_ports = set()
+        for item in self._list_in(poe_raw):
+            try:
+                poe_ports.add(int(item.get("port")))
+            except (TypeError, ValueError, AttributeError):
+                pass
+
+        # MAC table (ports numbered from 1) → device names; busiest port = uplink
+        names = {}
+        gw = self._gateway()
+        gw_macs = set()
+        for c in ((gw.data or {}).get("clients", []) if gw else []):
+            if c.get("mac"):
+                names[_norm_mac(c["mac"])] = c.get("name") or c["mac"].upper()
+        gw_sys = ((gw.data or {}).get("sysinfo") or {}) if gw else {}
+        if gw_sys.get("sys_mac"):
+            gw_macs.add(_norm_mac(gw_sys["sys_mac"]))
+        by_port = {}
+        for row in self._list_in(raw.get("mac")):
+            if not isinstance(row, dict):
+                continue
+            try:
+                pid = int(row.get("port")) - 1
+            except (TypeError, ValueError):
+                continue
+            mac = _norm_mac(row.get("mac"))
+            if mac and mac not in by_port.setdefault(pid, []):
+                by_port[pid].append(mac)
+        uplink = None
+        if by_port:
+            uplink = next((p for p, ms in by_port.items() if gw_macs & set(ms)), None)
+            if uplink is None:
+                uplink = max(by_port, key=lambda p: len(by_port[p]))
+
+        ports = []
+        for i, item in enumerate(self._list_in(raw.get("port"))):
+            if not isinstance(item, dict):
+                continue
+            try:
+                pid = int(item.get("port", i))
+            except (TypeError, ValueError):
+                pid = i
+            has_poe = pid in poe_ports
+            devices = [] if pid == uplink else [names.get(m, m.upper()) for m in by_port.get(pid, [])]
+            vids = item.get("vid") if isinstance(item.get("vid"), list) else []
+            ports.append({
+                "port": pid, "label": f"Port {pid + 1}",
+                "link": item.get("status") == 1,
+                "enabled": item.get("enable") == 1,
+                "speed": self._ES_SPEED.get(item.get("dup_r")) if item.get("status") == 1 else None,
+                "rx_rate": item.get("rxSpeed"), "tx_rate": item.get("txSpeed"),
+                "rx_bytes": item.get("rxBytes"), "tx_bytes": item.get("txBytes"),
+                "errors": (item.get("rxBad") or 0) + (item.get("txBad") or 0),
+                "loop": bool(item.get("loop")),
+                "fiber": item.get("isFiber") == 1,
+                "pvid": item.get("pvid"),
+                "vlans": ",".join(str(v) for v in vids),
+                "vlan_mode": "trunk" if str(item.get("vlanType")) == "1" else "access",
+                "uplink": pid == uplink,
+                "poe": has_poe,
+                "poe_on": (item.get("pEnable") == 1) if has_poe else None,
+                "poe_active": (item.get("pStatus") == 1) if has_poe else None,
+                "poe_power": self._num(item.get("pPower"), 1000, 2) if has_poe else None,
+                "poe_voltage": self._num(item.get("pVoltage"), 1000, 1) if has_poe else None,
+                "poe_current": item.get("pCurrent") if has_poe else None,
+                "poe_fault": bool(item.get("pFault")) if has_poe else None,
+                "devices": devices[:20],
+            })
+        info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+        return {
+            "es_ports": sorted(ports, key=lambda p: p["port"]),
+            "es_uplink": f"Port {uplink + 1}" if uplink is not None else None,
+            "es_hostname": info.get("hostname"),
+            "poe_max": self._num(poe_raw.get("maxp"), 1000),
+            "poe_used": self._num(poe_raw.get("usedp"), 1000),
+            "poe_remaining": self._num(poe_raw.get("remap"), 1000),
+            "loop_ports": [p["label"] for p in ports if p["loop"]],
+        }
+
+    async def async_es_poe(self, port, on):
+        await self._esw_write("poe.cgi", {"portid": port, "mode": "1" if on else "0"})
+        await asyncio.sleep(1.5 if on else 1)
+        await self.async_request_refresh()
+
+    async def async_es_poe_restart(self, port):
+        await self._esw_write("home.cgi?cmd=poe_restart", {"portid": port})
+
+    async def async_es_reboot(self):
+        await self._esw_write("reboot.cgi")
 
     async def _pick_mode(self):
         node = gateway_knows_switch(self.hass, self.host) or {}
@@ -461,15 +584,21 @@ class SwitchCoordinator(DataUpdateCoordinator):
         gw_node = gateway_knows_switch(self.hass, self.host) or {}
 
         if self.mode == "es":
-            es = await self._read_es()
+            raw = await self._read_es()
+            self._poll += 1
+            parsed = self._parse_es(raw)
+            info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
             return {
-                "online": bool(gw_node) or bool(es),
+                "online": bool(gw_node) or bool(parsed["es_ports"]),
                 "mode": "es", "ports": [], "uplink": None,
-                "model": gw_node.get("model"), "serial": gw_node.get("sn"),
-                "mac": gw_node.get("mac"), "firmware": None,
-                "ports_supported": False, "loop_ports": [], "crc_total": None,
-                "es_raw": es,
-                "es_working": bool(getattr(self, "_es_variant", None)),
+                "model": info.get("devtype") or gw_node.get("model"),
+                "serial": info.get("sn") or gw_node.get("sn"),
+                "mac": info.get("mac") or gw_node.get("mac"),
+                "firmware": info.get("sver"),
+                "hw_version": info.get("hver"),
+                "ports_supported": bool(parsed["es_ports"]),
+                "crc_total": None, **parsed,
+                "es_errors": raw.get("_errors"),
             }
 
         ps = await self._call("devSta.get", "port_show")
@@ -604,12 +733,10 @@ class SwitchOnline(_Base, BinarySensorEntity):
     def extra_state_attributes(self):
         d = self.coordinator.data or {}
         if d.get("mode") == "es":
-            raw = d.get("es_raw") or {}
             return {"connection": "via router (ES series)", "ip": self.coordinator.host,
                     "serial": d.get("serial"), "mac": d.get("mac"),
-                    "es_reply": "working" if d.get("es_working") else "no answer yet",
-                    "panel": str(raw.get("rest_get_panel.cgi"))[:1000] if raw else None,
-                    "ports": str(raw.get("rest_get_port.cgi"))[:1000] if raw else None}
+                    "ports_read": len(d.get("es_ports") or []),
+                    "errors": {k: v for k, v in (d.get("es_errors") or {}).items() if v} or None}
         return {"connection": "via router" if d.get("mode") == "relay" else "direct",
                 "ip": self.coordinator.host, "serial": d.get("serial"),
                 "mac": d.get("mac"),
@@ -949,15 +1076,216 @@ def _per_port(coord, entry, async_add_entities, factory, skip_ag=True):
     entry.async_on_unload(coord.async_add_listener(_add))
 
 
+class _EsPort(_Base):
+    def __init__(self, coord, key, port, label):
+        super().__init__(coord, f"es_{key}_{port}")
+        self._port_id = port
+        self._attr_name = label
+
+    def _p(self):
+        for p in (self.coordinator.data or {}).get("es_ports", []):
+            if p["port"] == self._port_id:
+                return p
+        return None
+
+    @property
+    def available(self):
+        return super().available and self._p() is not None
+
+
+class EsPortLink(_EsPort, BinarySensorEntity):
+    _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+
+    def __init__(self, coord, port):
+        super().__init__(coord, "link", port, f"Port {port + 1}")
+
+    @property
+    def is_on(self):
+        return bool((self._p() or {}).get("link"))
+
+    @property
+    def icon(self):
+        p = self._p() or {}
+        if p.get("uplink"):
+            return "mdi:arrow-up-network"
+        return "mdi:ethernet" if p.get("link") else "mdi:ethernet-off"
+
+    @property
+    def extra_state_attributes(self):
+        p = self._p() or {}
+        attrs = {k: p.get(k) for k in ("speed", "vlan_mode", "pvid", "vlans", "rx_rate",
+                                       "tx_rate", "errors", "loop", "uplink", "fiber")}
+        if p.get("poe"):
+            attrs.update({"poe_on": p.get("poe_on"), "poe_active": p.get("poe_active"),
+                          "poe_power_w": p.get("poe_power"), "poe_voltage_v": p.get("poe_voltage"),
+                          "poe_current_ma": p.get("poe_current"), "poe_fault": p.get("poe_fault")})
+        attrs["devices"] = p.get("devices") or []
+        attrs["connected"] = ", ".join(p.get("devices") or []) or None
+        return attrs
+
+
+class EsPortPower(_EsPort, SensorEntity):
+    _attr_native_unit_of_measurement = "W"
+    _attr_device_class = "power"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coord, port):
+        super().__init__(coord, "poe_power", port, f"Port {port + 1} PoE Power")
+
+    @property
+    def native_value(self):
+        return (self._p() or {}).get("poe_power")
+
+
+class EsPortRate(_EsPort, SensorEntity):
+    _attr_native_unit_of_measurement = "kbit/s"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coord, port, field, label, icon):
+        super().__init__(coord, field, port, f"Port {port + 1} {label}")
+        self._field = field
+        self._attr_icon = icon
+
+    @property
+    def native_value(self):
+        return (self._p() or {}).get(self._field)
+
+
+class EsText(_Base, SensorEntity):
+    def __init__(self, coord, key, label, icon):
+        super().__init__(coord, f"es_{key}")
+        self._key = key
+        self._attr_name = label
+        self._attr_icon = icon
+
+    @property
+    def native_value(self):
+        return (self.coordinator.data or {}).get(self._key)
+
+
+class EsLoop(_Base, BinarySensorEntity):
+    _attr_name = "Loop Detected"
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+
+    def __init__(self, coord):
+        super().__init__(coord, "es_loop")
+
+    @property
+    def is_on(self):
+        return bool((self.coordinator.data or {}).get("loop_ports"))
+
+    @property
+    def extra_state_attributes(self):
+        return {"ports": (self.coordinator.data or {}).get("loop_ports", [])}
+
+
+class EsPortPoe(_EsPort, SwitchEntity):
+    _attr_icon = "mdi:flash"
+
+    def __init__(self, coord, port):
+        super().__init__(coord, "poe", port, f"Port {port + 1} PoE")
+
+    @property
+    def is_on(self):
+        return bool((self._p() or {}).get("poe_on"))
+
+    @property
+    def extra_state_attributes(self):
+        p = self._p() or {}
+        return {"powering_device": p.get("poe_active"), "power_w": p.get("poe_power"),
+                "connected": ", ".join(p.get("devices") or []) or None}
+
+    async def async_turn_on(self, **kwargs):
+        await self.coordinator.async_es_poe(self._port_id, True)
+
+    async def async_turn_off(self, **kwargs):
+        await self.coordinator.async_es_poe(self._port_id, False)
+
+
+class EsPortPoeRestart(_EsPort, ButtonEntity):
+    _attr_icon = "mdi:power-cycle"
+
+    def __init__(self, coord, port):
+        super().__init__(coord, "poe_restart", port, f"Port {port + 1} PoE Power-Cycle")
+
+    async def async_press(self):
+        await self.coordinator.async_es_poe_restart(self._port_id)
+
+
+class EsPoePower(_Base, SensorEntity):
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "W"
+    _attr_icon = "mdi:flash"
+
+    def __init__(self, coord, key, label):
+        super().__init__(coord, f"es_{key}")
+        self._key = key
+        self._attr_name = label
+
+    @property
+    def native_value(self):
+        v = (self.coordinator.data or {}).get(self._key)
+        try:
+            return round(float(v), 1)
+        except (TypeError, ValueError):
+            return None
+
+
+class EsReboot(_Base, ButtonEntity):
+    _attr_name = "Reboot"
+    _attr_icon = "mdi:restart"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coord):
+        super().__init__(coord, "es_reboot")
+
+    async def async_press(self):
+        await self.coordinator.async_es_reboot()
+
+
+def _es_per_port(coord, entry, async_add_entities, factory, poe_only=False):
+    seen = set()
+
+    def _add():
+        new = []
+        for p in (coord.data or {}).get("es_ports", []):
+            if p["port"] in seen or (poe_only and not p.get("poe")):
+                continue
+            seen.add(p["port"])
+            new.extend(factory(p["port"]))
+        if new:
+            async_add_entities(new)
+
+    _add()
+    entry.async_on_unload(coord.async_add_listener(_add))
+
+
 async def async_setup_platform_for_switch(hass, entry, async_add_entities, platform):
     coord = hass.data[DOMAIN][entry.entry_id]
     if coord.mode == "es":
-        # ES-series PoE switches: none of the MSW (managed-switch) settings
-        # exist on them — only expose what actually works.
+        # ES-series PoE switches: their own feature set (ports + PoE), read and
+        # controlled through the router's /api/switch relay.
         if platform == "binary_sensor":
-            async_add_entities([SwitchOnline(coord)])
+            async_add_entities([SwitchOnline(coord), EsLoop(coord)])
+            _es_per_port(coord, entry, async_add_entities, lambda n: [EsPortLink(coord, n)])
+        elif platform == "switch":
+            _es_per_port(coord, entry, async_add_entities, lambda n: [EsPortPoe(coord, n)],
+                         poe_only=True)
         elif platform == "button":
-            async_add_entities([SwitchRefresh(coord)])
+            async_add_entities([SwitchRefresh(coord), EsReboot(coord)])
+            _es_per_port(coord, entry, async_add_entities,
+                         lambda n: [EsPortPoeRestart(coord, n)], poe_only=True)
+        elif platform == "sensor":
+            async_add_entities([EsPoePower(coord, "poe_used", "PoE Power Used"),
+                                EsPoePower(coord, "poe_max", "PoE Power Budget"),
+                                EsPoePower(coord, "poe_remaining", "PoE Power Remaining"),
+                                EsText(coord, "es_uplink", "Uplink Port", "mdi:arrow-up-network"),
+                                EsText(coord, "es_hostname", "Switch Name", "mdi:tag")])
+            _es_per_port(coord, entry, async_add_entities,
+                         lambda n: [EsPortPower(coord, n)], poe_only=True)
+            _es_per_port(coord, entry, async_add_entities, lambda n: [
+                EsPortRate(coord, n, "rx_rate", "RX Rate", "mdi:download-network"),
+                EsPortRate(coord, n, "tx_rate", "TX Rate", "mdi:upload-network")])
         return
     if platform == "binary_sensor":
         async_add_entities([SwitchOnline(coord), SwitchLoop(coord)])
