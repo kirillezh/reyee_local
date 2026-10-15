@@ -10,7 +10,7 @@
 
 No cloud • No subscriptions • Direct LAN communication
 
-[![Latest Version](https://img.shields.io/github/v/release/marsh4200/reyee_local?style=for-the-badge&label=version)](https://github.com/marsh4200/reyee_local/releases/latest)
+[![Version](https://img.shields.io/badge/version-v1.25.0-2ea44f?style=for-the-badge)]()
 [![Home Assistant](https://img.shields.io/badge/Home_Assistant-Compatible-41BDF5?style=for-the-badge&logo=homeassistant)]()
 [![HACS](https://img.shields.io/badge/HACS-Custom-orange?style=for-the-badge)](https://github.com/hacs/integration)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)]()
@@ -89,27 +89,44 @@ Control almost everything directly from Home Assistant.
 
 - 🔄 Refresh Router
 - 🔍 Deep API Probe
-- 🛰 Discover Modules — maps everything your firmware exposes (read-only)
-- 🔀 Scan Switches — reads every switch through the router (read-only)
 
 ---
 
 # 🔀 Switches
 
-Add each switch **the same way as the router**:
+Switches live **inside your router entry**, in their own **Switches** group:
 
 ```
 Settings
 → Devices & Services
-→ Add Integration
 → Ruijie Reyee (Local)
-→ enter the switch IP, username, password
+→ + Add switch (on the router entry)
+→ pick the switch from the list (or Other IP…)
 ```
 
-The integration detects whether the IP is a router or a switch and sets it up
-accordingly. Switches are read directly when they answer, otherwise **through
-your router entry** (the same way the Reyee web interface manages them), so keep
-the router entry installed.
+The list shows the switches your router has already found. ES PoE switches
+need no password (they're managed through the router); for NBS switches leave
+the password empty to use the router's.
+
+The integration page is split into folding groups:
+
+| Group | What's in it |
+|-------|--------------|
+| 🌐 **Router** | the gateway and all its controls |
+| 🔀 **Switches** | every switch, each one clickable to its own ports / PoE / VLAN page |
+| 📶 **Access Points** | the APs the router sees |
+| 📱 **Connected Devices** | every tracked client |
+
+To remove a switch, open the **Switches** group's ⋮ menu → **Reconfigure** and
+tick it. Typing a switch IP into **Add Integration** also works: it's put into
+the router's Switches group instead of becoming a separate hub.
+
+> **Upgrading from v1.24 or older?** Switches you added as their own hub are
+> moved into the router's Switches group automatically on the first restart,
+> keeping the same entity IDs. Nothing to delete or re-add.
+
+Switches are read directly when they answer, otherwise **through the router**
+(the same way the Reyee web interface manages them).
 
 ## 🖧 NBS Managed Switches
 
@@ -162,8 +179,6 @@ router**, so they can be added even though a direct login to them fails.
   — doing so would cut the switch off from the router.
 - Every change uses the exact request the Reyee web interface sends. If a device
   rejects a change you get an error and nothing changes.
-- Discovery tools only **read**. Action-type modules (reboot, reset, kick,
-  delete…) are listed but never called.
 
 ---
 
@@ -175,6 +190,7 @@ router**, so they can be added even though a direct login to them fails.
 - ✅ RG-EW3000GX
 - ✅ NBS3100-24GT4SFP-V2 (ReyeeOS 2.380)
 - ✅ RG-ES220GS-P / RG-ES205GC-P (ESW_1.0)
+- ✅ RG-ES210GS-P / RG-ES208GC / RG-ES206GS-P
 
 | Model                     | Type                  | Status              |
 | ------------------------- | --------------------- | ------------------- |
@@ -183,6 +199,9 @@ router**, so they can be added even though a direct login to them fails.
 | NBS3100-24GT4SFP-V2       | Managed switch        | ✅ Tested            |
 | RG-ES220GS-P              | PoE switch (16+4)     | ✅ Tested            |
 | RG-ES205GC-P              | PoE switch (4+1)      | ✅ Tested            |
+| RG-ES210GS-P              | PoE switch (8+2 SFP)  | ✅ Supported         |
+| RG-ES208GC                | Switch (8, no PoE)    | ✅ Supported         |
+| RG-ES206GS-P              | PoE switch (4+2)      | ✅ Supported         |
 | Other ReyeeOS devices     |                       | ⚠️ Expected to work |
 
 
@@ -237,7 +256,7 @@ Enter:
 - Username
 - Password
 
-Repeat **Add Integration** with each switch IP to add your switches
+Then add your switches with **+ Add switch** on the router entry
 (see [Switches](#-switches)).
 
 ---
@@ -273,7 +292,6 @@ Restart Home Assistant.
 | `add_port_forward` | Create Port Forward |
 | `remove_port_forward` | Delete Port Forward |
 | `deep_probe` | Advanced API Diagnostics |
-| `discover_modules` | Map every eWeb module (read-only); optional `host` to scan a switch |
 | `set_port_description` | Switch — set port description |
 | `set_port_vlan` | Switch — set port VLAN (access / trunk / hybrid) |
 | `set_port_isolation` | Switch — port isolation on/off |
