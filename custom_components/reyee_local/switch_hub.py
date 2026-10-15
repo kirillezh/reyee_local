@@ -933,6 +933,14 @@ def _per_port(coord, entry, async_add_entities, factory, skip_ag=True):
 
 async def async_setup_platform_for_switch(hass, entry, async_add_entities, platform):
     coord = hass.data[DOMAIN][entry.entry_id]
+    if coord.mode == "es":
+        # ES-series PoE switches: none of the MSW (managed-switch) settings
+        # exist on them — only expose what actually works.
+        if platform == "binary_sensor":
+            async_add_entities([SwitchOnline(coord)])
+        elif platform == "button":
+            async_add_entities([SwitchRefresh(coord)])
+        return
     if platform == "binary_sensor":
         async_add_entities([SwitchOnline(coord), SwitchLoop(coord)])
         seen = set()
