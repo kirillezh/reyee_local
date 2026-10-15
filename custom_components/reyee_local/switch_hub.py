@@ -361,10 +361,21 @@ class SwitchCoordinator(DataUpdateCoordinator):
         code = body.get("code")
         if code not in (0, "0", None):
             return False, body
-        for key in ("result", "data"):
-            if key in body and body[key] not in (None, ""):
-                return True, _peel(body[key])
-        return True, {k: v for k, v in body.items() if k not in ("id", "code", "error")}
+        # Replies are wrapped twice: gateway {code,data:{…}} around the switch's own
+        # {result:…, dev_type:"esw", code:0}. Peel every layer down to `result`.
+        r = body
+        for _ in range(5):
+            if not isinstance(r, dict):
+                break
+            if r.get("code") not in (0, "0", None):
+                return False, r
+            if "result" in r and set(r) <= {"result", "dev_type", "code", "msg", "id", "error"}:
+                r = r["result"]
+            elif "data" in r and set(r) <= {"data", "code", "id", "error", "msg"}:
+                r = r["data"]
+            else:
+                break
+        return True, r
 
     async def _esw_write(self, url, data=None):
         ok, res = await self._esw(url, method="post", data=data)
@@ -460,6 +471,9 @@ class SwitchCoordinator(DataUpdateCoordinator):
         gw_sys = ((gw.data or {}).get("sysinfo") or {}) if gw else {}
         if gw_sys.get("sys_mac"):
             gw_macs.add(_norm_mac(gw_sys["sys_mac"]))
+        for n in ((gw.data or {}).get("topology", []) if gw else []):
+            if n.get("depth") == 0 and n.get("mac"):
+                gw_macs.add(_norm_mac(n["mac"]))
         by_port = {}
         for row in self._list_in(raw.get("mac")):
             if not isinstance(row, dict):
@@ -475,7 +489,9 @@ class SwitchCoordinator(DataUpdateCoordinator):
         if by_port:
             uplink = next((p for p, ms in by_port.items() if gw_macs & set(ms)), None)
             if uplink is None:
-                uplink = max(by_port, key=lambda p: len(by_port[p]))
+                non_poe = [p for p in by_port if p not in poe_ports]
+                pool = non_poe or list(by_port)
+                uplink = max(pool, key=lambda p: len(by_port[p]))
 
         ports = []
         for i, item in enumerate(self._list_in(raw.get("port"))):
