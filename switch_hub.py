@@ -379,7 +379,12 @@ class SwitchCoordinator(DataUpdateCoordinator):
             ["port", "poe", "vlan_list"] if self._poll % 10 == 0 else ["port", "poe"])
         for key in keys:
             ok, res = await self._esw(self.ES_READS[key])
-            raw[key] = res if ok else None
+            meaningful = ok and res not in (None, "", [], {}) and not (
+                isinstance(res, dict) and set(res) <= {"result", "dev_type"})
+            if meaningful:
+                raw[key] = res                 # keep the last good reply otherwise
+            elif key not in raw:
+                raw[key] = None
             if first:
                 raw.setdefault("_errors", {})[key] = None if ok else str(res)[:300]
         if self._poll % 5 == 0:
@@ -435,6 +440,10 @@ class SwitchCoordinator(DataUpdateCoordinator):
         """Parse the ES switch replies (field names confirmed on ES205GC-P / ES220GS-P)."""
         poe_raw = raw.get("poe") if isinstance(raw.get("poe"), dict) else {}
         poe_ports = set()
+        for row in (raw.get("panel") or []) if isinstance(raw.get("panel"), list) else []:
+            for cell in (row or []) if isinstance(row, list) else []:
+                if isinstance(cell, dict) and cell.get("poe") == 1 and cell.get("lpid") is not None:
+                    poe_ports.add(int(cell["lpid"]))
         for item in self._list_in(poe_raw):
             try:
                 poe_ports.add(int(item.get("port")))
@@ -527,7 +536,9 @@ class SwitchCoordinator(DataUpdateCoordinator):
             "es_uplink": f"Port {uplink + 1}" if uplink is not None else None,
             "es_hostname": info.get("hostname"),
             "poe_max": self._num(poe_raw.get("maxp"), 1000),
-            "poe_used": self._num(poe_raw.get("usedp"), 1000),
+            "poe_used": self._num(poe_raw.get("usedp"), 1000) if poe_raw.get("usedp") is not None
+                        else (round(sum(p["poe_power"] or 0 for p in ports if p["poe"]), 1)
+                              if any(p["poe"] for p in ports) else None),
             "poe_remaining": self._num(poe_raw.get("remap"), 1000),
             "loop_ports": [p["label"] for p in ports if p["loop"]],
         }
