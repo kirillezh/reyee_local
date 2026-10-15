@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="images/reyee_ha_logo_bounce.png" width="600" alt="Ruijie Reyee (Local) for Home Assistant" />
+</p>
+
 # 🌐 Ruijie Reyee (Local) for Home Assistant
 
 <p align="center">
