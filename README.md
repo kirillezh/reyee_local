@@ -10,7 +10,7 @@
 
 No cloud • No subscriptions • Direct LAN communication
 
-[![Version](https://img.shields.io/badge/version-v1.16.1-2ea44f?style=for-the-badge)]()
+[![Latest Version](https://img.shields.io/github/v/release/marsh4200/reyee_local?style=for-the-badge&label=version)](https://github.com/marsh4200/reyee_local/releases/latest)
 [![Home Assistant](https://img.shields.io/badge/Home_Assistant-Compatible-41BDF5?style=for-the-badge&logo=homeassistant)]()
 [![HACS](https://img.shields.io/badge/HACS-Custom-orange?style=for-the-badge)](https://github.com/hacs/integration)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)]()
