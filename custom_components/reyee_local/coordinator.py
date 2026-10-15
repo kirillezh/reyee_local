@@ -12,6 +12,7 @@ Confirmed sources (from live eWeb capture):
   devSta.get   arp                                            → fallback client coverage
   devConfig.get network / mllb                                → VLANs / WAN uplinks
 """
+import asyncio
 import ipaddress
 import json
 import logging
@@ -83,6 +84,39 @@ def _is_error(r):
     return False
 
 
+# Router features exposed as on/off switches. All confirmed readable on the
+# live gateway via discovery; written back with the full config + one field.
+#   key, method ("dev"=devConfig / "ac"=acConfig), field, on-value, off-value, name, icon
+FEATURES = (
+    ("hwnat", "dev", "enabled", "true", "false", "Hardware NAT", "mdi:chip"),
+    ("firewall_extern", "dev", "sip_alg", "true", "false", "SIP ALG", "mdi:phone-voip"),
+    ("igmpproxy", "dev", "enable", "1", "0", "IGMP Proxy", "mdi:television-play"),
+    ("line_detection", "dev", "enable", "1", "0", "WAN Link Detection", "mdi:lan-check"),
+    ("radioLb", "ac", "enable", "1", "0", "WiFi Load Balancing", "mdi:scale-balance"),
+)
+VPN_SERVERS = (("openvpn_server", "OpenVPN Server"), ("l2tp_server", "L2TP Server"),
+               ("pptp_server", "PPTP Server"))
+_STAMPS = ("version", "configTime", "currentTime", "configId",
+           "subConfigId", "networkId")
+_SLOW_EVERY = 10   # feature/VPN/neighbour reads every Nth poll
+
+
+def _peel(r):
+    """Strip nested {code,id,data,error} wrappers down to the payload."""
+    for _ in range(4):
+        if isinstance(r, dict) and "data" in r and set(r) <= {"code", "id", "data", "error"}:
+            r = r["data"]
+        else:
+            break
+    return r
+
+
+def is_switch_model(model, role=None):
+    m = (model or "").upper()
+    return (str(role or "").upper() == "SWITCH"
+            or m.startswith(("RG-ES", "ES", "NBS", "RG-NBS", "RG-S", "S2")))
+
+
 class ReyeeCoordinator(DataUpdateCoordinator):
     def __init__(self, hass, entry, api):
         interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
@@ -90,6 +124,10 @@ class ReyeeCoordinator(DataUpdateCoordinator):
                          update_interval=timedelta(seconds=interval))
         self.api = api
         self.entry = entry
+        self._poll = 0
+        self._slow = {"features": {}, "vpn": {}, "net_names": {}, "neighbors": [],
+                      "port_desc": {}}
+        self._switches = {}
 
     async def _get(self, module, data=None):
         """Proven path (devSta.get, unwrapped) for classic modules."""
@@ -245,6 +283,12 @@ class ReyeeCoordinator(DataUpdateCoordinator):
                 if nm:
                     remark[_norm_mac(e.get("mac"))] = nm
 
+        # ── Slow-changing reads (features, VPN, saved names, neighbours) ──
+        if self._poll % _SLOW_EVERY == 0:
+            await self._read_slow()
+        self._poll += 1
+        net_names = self._slow["net_names"]
+
         flow_user = await self._getx("flow", {"func": "user_info"})
         rate_by_ip = {}
         if isinstance(flow_user, dict):
@@ -276,6 +320,7 @@ class ReyeeCoordinator(DataUpdateCoordinator):
             # switch) the client hangs off — not the client. Never use it as
             # the client's name; expose it as access_point instead.
             name = (remark.get(mac)
+                    or net_names.get(mac)
                     or _clean_name(u.get("hostName"))
                     or _clean_name(u.get("hostname"))
                     or mac.upper())
@@ -517,7 +562,135 @@ class ReyeeCoordinator(DataUpdateCoordinator):
             "led_off_serials": sorted(led_off_serials),
             "led_default_close": led_default_close,
             "led_devices": led_devices,
+            "switches": await self._read_switches(),
+            "features": self._slow["features"],
+            "vpn": self._slow["vpn"],
+            "neighbors": self._slow["neighbors"],
         }
+
+    # ── Slow reads ───────────────────────────────────────────────────────
+    async def _read_slow(self):
+        feats = {}
+        for key, kind, field, on_v, _off, _n, _i in FEATURES:
+            cfg = _peel(await self._ac(key, {"groupId": "0"}) if kind == "ac"
+                        else await self._cfgx(key))
+            if isinstance(cfg, dict) and field in cfg:
+                feats[key] = {"on": str(cfg.get(field)) == on_v, "cfg": cfg}
+        vpn = {}
+        for key, _n in VPN_SERVERS:
+            cfg = _peel(await self._cfgx(key))
+            if isinstance(cfg, dict) and "enable" in cfg:
+                vpn[key] = str(cfg.get("enable")) == "1"
+        names = {}
+        nt = _peel(await self._cfgx("net_tml"))
+        if isinstance(nt, dict):
+            for e in nt.get("nt_info", []) or []:
+                nm = _clean_name(e.get("name"))
+                if nm and e.get("mac"):
+                    names[_norm_mac(e["mac"])] = nm
+        neigh, seen = [], set()
+        for mod in ("neighbor", "esw_neighbor"):
+            r = _peel(await self._getx(mod, no_parse=False))
+            for e in (r.get("neighbor", []) if isinstance(r, dict) else []):
+                key = e.get("devSN") or e.get("ip")
+                if key and key not in seen:
+                    seen.add(key)
+                    neigh.append({"sn": e.get("devSN"), "ip": e.get("ip"),
+                                  "mac": e.get("devMac"), "model": e.get("deviceType"),
+                                  "role": e.get("role"),
+                                  "is_switch": is_switch_model(e.get("deviceType"),
+                                                               e.get("role"))})
+        # managed-switch port descriptions (config, changes rarely)
+        desc = {}
+        for n in neigh:
+            if n.get("is_switch") and n.get("ip"):
+                cfg = _peel(await self._relay("devConfig.get", "port_phy", n["ip"]))
+                rows = cfg.get("data") if isinstance(cfg, dict) else None
+                if isinstance(rows, list):
+                    desc[n["ip"]] = {r.get("lpid"): (r.get("description") or "").strip()
+                                     for r in rows if isinstance(r, dict)}
+        if desc:
+            self._slow["port_desc"] = desc
+        # keep last good values if a read failed this round
+        self._slow["features"] = feats or self._slow["features"]
+        self._slow["vpn"] = vpn or self._slow["vpn"]
+        self._slow["net_names"] = names or self._slow["net_names"]
+        self._slow["neighbors"] = neigh or self._slow["neighbors"]
+
+    async def _relay(self, method, module, ip, data=None, no_parse=True):
+        """Call a module on a managed switch through the gateway (remoteIp)."""
+        try:
+            r = await asyncio.wait_for(self.api.raw_cmd(
+                method, module, data=data, no_parse=no_parse,
+                extra={"remoteIp": ip}), 8)
+        except Exception:  # noqa: BLE001
+            return None
+        return None if _is_error(r) else r
+
+    async def _read_switches(self):
+        """Per-port live status of each managed (MSW) switch via the gateway."""
+        out = {}
+        own = {e.data.get("host") for e in self.hass.config_entries.async_entries(DOMAIN)
+               if e.data.get("kind") == "switch"} if self.hass else set()
+        for n in self._slow.get("neighbors", []):
+            ip, sn = n.get("ip"), n.get("sn")
+            if not (n.get("is_switch") and ip and sn) or ip in own:
+                continue
+            ps = _peel(await self._relay("devSta.get", "port_show", ip))
+            if not isinstance(ps, list):
+                # ES-series switches don't answer the MSW relay — keep last value
+                if sn in self._switches:
+                    out[sn] = self._switches[sn]
+                continue
+            desc = self._slow.get("port_desc", {}).get(ip, {})
+            ports = []
+            for p in ps:
+                if not isinstance(p, dict) or not str(p.get("nm", "")).startswith(("Gi", "Te", "Fa", "Ag")):
+                    continue
+                if str(p.get("nm")).startswith("Ag") and not p.get("lk"):
+                    continue          # unused aggregate groups
+                lp = p.get("lp")
+                ports.append({
+                    "lpid": lp, "name": p.get("nm"),
+                    "link": p.get("lk") == 1,
+                    "speed": p.get("r_spd") or None,
+                    "rx_rate": p.get("iRt"), "tx_rate": p.get("oRt"),
+                    "rx_bytes": p.get("iBt"), "tx_bytes": p.get("oBt"),
+                    "crc_errors": p.get("crc"), "pvid": p.get("pvid"),
+                    "vlans": p.get("pmtVAct") or p.get("pmtV") or "",
+                    "description": desc.get(lp) or "",
+                })
+            out[sn] = {"ip": ip, "sn": sn, "model": n.get("model"), "kind": "msw",
+                       "ports": ports}
+        self._switches = out
+        return out
+
+    async def async_set_feature(self, key, on):
+        spec = next(f for f in FEATURES if f[0] == key)
+        _k, kind, field, on_v, off_v, _n, _i = spec
+        cfg = _peel(await self._ac(key, {"groupId": "0"}) if kind == "ac"
+                    else await self._cfgx(key))
+        if not isinstance(cfg, dict):
+            raise UpdateFailed(f"Could not read {key} before writing")
+        out = {k: v for k, v in cfg.items() if k not in _STAMPS}
+        out[field] = on_v if on else off_v
+        if kind == "ac":
+            await self.api.set_ac_config(key, out)
+        else:
+            await self.api.set_config(key, out)
+        self._poll = 0          # re-read features on the next refresh
+        await self.async_request_refresh()
+
+    def switch_targets(self):
+        """IPs of managed switches seen via topology + neighbour discovery."""
+        out = {}
+        for n in (self.data or {}).get("topology", []):
+            if n.get("ip") and is_switch_model(n.get("model"), n.get("type")):
+                out[n["ip"]] = n.get("model") or n.get("name")
+        for n in self._slow.get("neighbors", []):
+            if n.get("ip") and n.get("is_switch"):
+                out[n["ip"]] = n.get("model")
+        return out
 
     # ── Writes (unchanged) ───────────────────────────────────────────────
     async def async_set_primary_wan(self, ifname):

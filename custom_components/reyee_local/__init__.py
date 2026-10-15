@@ -12,12 +12,89 @@ from .const import DOMAIN, PLATFORMS, CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from .api import ReyeeLocalAPI
 from .coordinator import ReyeeCoordinator
 from .diagnostics_probe import run_deep_probe
+from .discovery import run_discovery
 from .subentries import NETWORK, ensure_subentries, migrate_devices, subentry_id
+from .switch_hub import SwitchCoordinator, SWITCH_PLATFORMS, is_switch_entry
 
 _LOGGER = logging.getLogger(__name__)
 
 
+def _switch_by_host(hass, host):
+    from homeassistant.exceptions import HomeAssistantError
+    for c in hass.data.get(DOMAIN, {}).values():
+        if isinstance(c, SwitchCoordinator) and c.host == host:
+            return c
+    raise HomeAssistantError(f"No Reyee switch entry for {host}")
+
+
+def _register_switch_services(hass):
+    if hass.services.has_service(DOMAIN, "set_port_description"):
+        return
+    base = {vol.Required("switch_ip"): cv.string, vol.Required("port"): cv.string}
+
+    async def _desc(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_set_port_description(
+            call.data["port"], call.data.get("description", ""))
+
+    async def _vlan(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_set_port_vlan(
+            call.data["port"], call.data["mode"], call.data["pvid"],
+            call.data.get("permit_vlans", ""), call.data.get("untag_vlans", ""))
+
+    async def _iso(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_set_port_isolation(
+            call.data["port"], call.data["enabled"])
+
+    async def _rate(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_set_port_rate_limit(
+            call.data["port"], call.data.get("in_kbps", 0), call.data.get("out_kbps", 0))
+
+    async def _vadd(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_create_vlan(
+            call.data["vlan_id"], call.data.get("name", ""))
+
+    async def _vdel(call):
+        await _switch_by_host(hass, call.data["switch_ip"]).async_delete_vlan(call.data["vlan_id"])
+
+    vbase = {vol.Required("switch_ip"): cv.string,
+             vol.Required("vlan_id"): vol.All(vol.Coerce(int), vol.Range(min=1, max=4094))}
+    hass.services.async_register(DOMAIN, "create_vlan", _vadd, schema=vol.Schema({
+        **vbase, vol.Optional("name", default=""): cv.string}))
+    hass.services.async_register(DOMAIN, "delete_vlan", _vdel, schema=vol.Schema(vbase))
+    hass.services.async_register(DOMAIN, "set_port_description", _desc, schema=vol.Schema({
+        **base, vol.Optional("description", default=""): cv.string}))
+    hass.services.async_register(DOMAIN, "set_port_vlan", _vlan, schema=vol.Schema({
+        **base, vol.Required("mode"): vol.In(["access", "trunk", "hybrid"]),
+        vol.Required("pvid"): vol.Coerce(int),
+        vol.Optional("permit_vlans", default=""): cv.string,
+        vol.Optional("untag_vlans", default=""): cv.string}))
+    hass.services.async_register(DOMAIN, "set_port_isolation", _iso, schema=vol.Schema({
+        **base, vol.Required("enabled"): cv.boolean}))
+    hass.services.async_register(DOMAIN, "set_port_rate_limit", _rate, schema=vol.Schema({
+        **base, vol.Optional("in_kbps", default=0): vol.Coerce(int),
+        vol.Optional("out_kbps", default=0): vol.Coerce(int)}))
+
+
+async def _async_setup_switch(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """A managed switch added as its own hub entry."""
+    api = ReyeeLocalAPI(
+        host=entry.data[CONF_HOST],
+        password=entry.data.get(CONF_PASSWORD, ""),
+        username=entry.data.get(CONF_USERNAME, "admin"),
+        session=async_get_clientsession(hass),
+    )
+    coordinator = SwitchCoordinator(hass, entry, api)
+    await coordinator.async_config_entry_first_refresh()
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    _register_switch_services(hass)
+    await hass.config_entries.async_forward_entry_setups(entry, SWITCH_PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    if is_switch_entry(entry):
+        return await _async_setup_switch(hass, entry)
     api = ReyeeLocalAPI(
         host=entry.data[CONF_HOST],
         password=entry.data[CONF_PASSWORD],
@@ -81,6 +158,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for coord in _coords():
             await run_deep_probe(hass, coord)
 
+    async def _discover_modules(call: ServiceCall):
+        host = call.data.get("host")
+        for coord in _coords():
+            if not host:
+                await run_discovery(hass, coord)
+                continue
+            # Scan another Reyee device (managed switch / AP) directly.
+            other = ReyeeLocalAPI(
+                host=host,
+                password=call.data.get("password") or coord.api.password,
+                username=call.data.get("username") or coord.api.username,
+                session=async_get_clientsession(hass),
+            )
+            await run_discovery(hass, coord, api=other)
+            break
+
     async def _set_primary_wan(call: ServiceCall):
         ifname = call.data["ifname"]
         for coord in _coords():
@@ -130,6 +223,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not hass.services.has_service(DOMAIN, "deep_probe"):
         hass.services.async_register(DOMAIN, "deep_probe", _deep_probe)
+        hass.services.async_register(
+            DOMAIN, "discover_modules", _discover_modules,
+            schema=vol.Schema({
+                vol.Optional("host"): cv.string,
+                vol.Optional("username"): cv.string,
+                vol.Optional("password"): cv.string,
+            }),
+        )
         hass.services.async_register(
             DOMAIN, "set_primary_wan", _set_primary_wan,
             schema=vol.Schema({vol.Required("ifname"): cv.string}),
@@ -190,11 +291,12 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    platforms = SWITCH_PLATFORMS if is_switch_entry(entry) else PLATFORMS
+    unloaded = await hass.config_entries.async_unload_platforms(entry, platforms)
     if unloaded:
         hass.data[DOMAIN].pop(entry.entry_id, None)
-        if not hass.data[DOMAIN]:
-            for svc in ("deep_probe", "set_primary_wan", "set_forced_switch",
+        if not any(isinstance(c, ReyeeCoordinator) for c in hass.data[DOMAIN].values()):
+            for svc in ("deep_probe", "discover_modules", "set_primary_wan", "set_forced_switch",
                         "add_port_forward", "remove_port_forward", "set_ssid",
                         "block_device", "unblock_device", "set_rate_limit"):
                 hass.services.async_remove(DOMAIN, svc)

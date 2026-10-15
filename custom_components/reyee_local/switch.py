@@ -7,12 +7,16 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
+from .switch_hub import is_switch_entry, async_setup_platform_for_switch
 from .subentries import NETWORK, bind
+from .coordinator import FEATURES
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
+    if is_switch_entry(entry):
+        return await async_setup_platform_for_switch(hass, entry, async_add_entities, "switch")
     async_add_entities = bind(entry, async_add_entities, NETWORK)
     coordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([
@@ -49,6 +53,20 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     _add_ssids()
     entry.async_on_unload(coordinator.async_add_listener(_add_ssids))
+
+    seen_feats = set()
+
+    def _add_features():
+        new = []
+        for key in (coordinator.data or {}).get("features", {}):
+            if key not in seen_feats:
+                seen_feats.add(key)
+                new.append(ReyeeFeatureSwitch(coordinator, entry, key))
+        if new:
+            async_add_entities(new)
+
+    _add_features()
+    entry.async_on_unload(coordinator.async_add_listener(_add_features))
 
 
 class ReyeeForcedSwitch(CoordinatorEntity, SwitchEntity):
@@ -196,3 +214,37 @@ class ReyeeDeviceLedSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs):
         await self.coordinator.async_set_device_led(self._sn, False)
+
+
+class ReyeeFeatureSwitch(CoordinatorEntity, SwitchEntity):
+    """On/off for a router feature (Hardware NAT, SIP ALG, IGMP proxy, ...)."""
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator, entry, key):
+        super().__init__(coordinator)
+        self._key = key
+        spec = next(f for f in FEATURES if f[0] == key)
+        self._attr_name = f"Reyee {spec[5]}"
+        self._attr_icon = spec[6]
+        self._attr_unique_id = f"{entry.entry_id}_feature_{key}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            manufacturer="Ruijie",
+            name=entry.title,
+            configuration_url=f"http://{entry.data['host']}",
+        )
+
+    @property
+    def available(self):
+        return super().available and self._key in (self.coordinator.data or {}).get("features", {})
+
+    @property
+    def is_on(self):
+        f = (self.coordinator.data or {}).get("features", {}).get(self._key)
+        return bool(f and f.get("on"))
+
+    async def async_turn_on(self, **kwargs):
+        await self.coordinator.async_set_feature(self._key, True)
+
+    async def async_turn_off(self, **kwargs):
+        await self.coordinator.async_set_feature(self._key, False)
