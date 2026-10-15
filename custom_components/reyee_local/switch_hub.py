@@ -359,6 +359,23 @@ class SwitchCoordinator(DataUpdateCoordinator):
                 return r, v
         return None, None
 
+    async def _dump_esw_code(self):
+        """Once per HA start: save how the router's web code talks to ES switches."""
+        flag = self.hass.data.setdefault(DOMAIN + "_esw_code", {"done": False})
+        if flag["done"]:
+            return
+        flag["done"] = True
+        gw = self._gateway()
+        if gw is None:
+            return
+        from .discovery import extract_esw_code
+        try:
+            code = await extract_esw_code(gw.api)
+        except Exception as err:  # noqa: BLE001
+            code = {"error": str(err)}
+        await self.hass.async_add_executor_job(
+            _dump, self.hass.config.path("reyee_es_code.json"), code)
+
     async def _read_es(self):
         if not hasattr(self, "_es_variant"):
             self._es_variant, report = None, {}
@@ -373,6 +390,7 @@ class SwitchCoordinator(DataUpdateCoordinator):
                     f"reyee_es_{self.host.replace('.', '_')}.json"),
                 {"host": self.host, "variant": str(self._es_variant), "replies": report})
         if not self._es_variant:
+            self.hass.async_create_task(self._dump_esw_code())
             return {}
         out = {}
         for url in ("rest_get_panel.cgi", "rest_get_port.cgi"):

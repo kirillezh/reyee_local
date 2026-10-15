@@ -586,3 +586,34 @@ async def run_switch_scan(hass, coordinator):
     async_create(hass, "Done.\n\n" + "\n".join(lines) +
                  "\n\nSend back **one file**: `/config/reyee_switches.json`",
                  title="Reyee Switch Scan", notification_id=nid)
+
+
+# Patterns around the gateway eWeb's ES-switch transport (how "esw" calls are sent).
+_ESW_CODE_PATTERNS = (
+    r"apiArrEsw", r"isEsw", r"doCmdArr", r"cmdEsw", r"eswApi", r"switchApi",
+    r'module\s*:\s*"esw"', r'"/esw', r"esw\?", r"rest_get_panel", r"rest_get_port\.cgi",
+    r"poe[_a-zA-Z]*\.cgi", r"PREFIX\s*\+\s*\"/", r"api/[a-zA-Z_]+\?auth",
+)
+
+
+async def extract_esw_code(api):
+    """Download the gateway eWeb JS and return code snippets showing how it
+    talks to ES-series switches (read-only — only fetches the web files)."""
+    jar = aiohttp.CookieJar(unsafe=True)
+    async with aiohttp.ClientSession(cookie_jar=jar) as sess:
+        base, files, _pages, _login = await _collect_js(api, sess)
+    api.sid = None      # our extra login may have replaced the integration's
+    out = {"router": base, "files": len(files), "snippets": {}}
+    for pat in _ESW_CODE_PATTERNS:
+        rx = re.compile(pat)
+        found = []
+        for url, text in files.items():
+            for m in rx.finditer(text):
+                found.append({"file": url.rsplit("/", 1)[-1],
+                              "code": text[max(0, m.start() - 700): m.end() + 700]})
+                if len(found) >= 12:
+                    break
+            if len(found) >= 12:
+                break
+        out["snippets"][pat] = found
+    return out
