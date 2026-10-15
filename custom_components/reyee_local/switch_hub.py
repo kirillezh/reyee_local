@@ -339,6 +339,7 @@ class SwitchCoordinator(DataUpdateCoordinator):
         "sys_power": "rest_get_sys_power_info.cgi",
         "info": "rest_get_info.cgi",
         "panel": "rest_get_panel.cgi",
+        "vlan_list": "rest_get_vlan_list.cgi",
     }
 
     def _es_sn(self):
@@ -374,7 +375,8 @@ class SwitchCoordinator(DataUpdateCoordinator):
     async def _read_es(self):
         raw = dict(getattr(self, "_es_cache", {}))
         first = not hasattr(self, "_es_dumped")
-        keys = list(self.ES_READS) if first else ["port", "poe"]
+        keys = list(self.ES_READS) if first else (
+            ["port", "poe", "vlan_list"] if self._poll % 10 == 0 else ["port", "poe"])
         for key in keys:
             ok, res = await self._esw(self.ES_READS[key])
             raw[key] = res if ok else None
@@ -489,6 +491,7 @@ class SwitchCoordinator(DataUpdateCoordinator):
                 "fiber": item.get("isFiber") == 1,
                 "pvid": item.get("pvid"),
                 "vlans": ",".join(str(v) for v in vids),
+                "vid_list": [int(v) for v in vids if str(v).isdigit()],
                 "vlan_mode": "trunk" if str(item.get("vlanType")) == "1" else "access",
                 "uplink": pid == uplink,
                 "poe": has_poe,
@@ -501,7 +504,25 @@ class SwitchCoordinator(DataUpdateCoordinator):
                 "devices": devices[:20],
             })
         info = raw.get("info") if isinstance(raw.get("info"), dict) else {}
+        # VLANs: switch's own list, else every VLAN seen on its ports; names from the router
+        gw_names = {str(v.get("vlan_id")): v.get("name")
+                    for v in ((gw.data or {}).get("vlans", []) if gw else []) if v.get("vlan_id")}
+        vids = set()
+        for v in self._list_in(raw.get("vlan_list")) or (raw.get("vlan_list") or []):
+            vid = self._first(v, ("vlanid", "vid", "id", "v")) if isinstance(v, dict) else v
+            if str(vid).isdigit():
+                vids.add(int(vid))
+        for item in self._list_in(raw.get("port")):
+            for vid in (item.get("vid") or []) if isinstance(item, dict) else []:
+                if str(vid).isdigit():
+                    vids.add(int(vid))
+        on_switch = set(vids)
+        vids |= {int(v) for v in gw_names if str(v).isdigit() and 1 <= int(v) <= 4094}
+        es_vlans = [{"id": str(v), "name": gw_names.get(str(v)) or ("Default" if v == 1 else f"VLAN {v}"),
+                     "on_switch": v in on_switch}
+                    for v in sorted(vids)]
         return {
+            "es_vlans": es_vlans,
             "es_ports": sorted(ports, key=lambda p: p["port"]),
             "es_uplink": f"Port {uplink + 1}" if uplink is not None else None,
             "es_hostname": info.get("hostname"),
@@ -510,6 +531,33 @@ class SwitchCoordinator(DataUpdateCoordinator):
             "poe_remaining": self._num(poe_raw.get("remap"), 1000),
             "loop_ports": [p["label"] for p in ports if p["loop"]],
         }
+
+    async def async_es_set_vlan(self, port, vid=None, mode=None):
+        """Change a port's VLAN and/or mode (access/trunk) — vlan_p.cgi vlan_setting_add."""
+        p = next((x for x in (self.data or {}).get("es_ports", []) if x["port"] == port), None)
+        if p is None:
+            raise HomeAssistantError(f"No port {port + 1}")
+        if p.get("uplink"):
+            raise HomeAssistantError(
+                f"{p['label']} is this switch's uplink to the router — changing its VLAN "
+                "would cut the switch off.")
+        mode = mode or p.get("vlan_mode") or "access"
+        native = int(vid if vid is not None else (p.get("pvid") or 1))
+        if mode == "trunk":
+            permit = sorted(set(p.get("vid_list") or []) | {native})
+            if p.get("vlan_mode") != "trunk":       # access → trunk: allow every VLAN
+                permit = sorted({int(v["id"]) for v in (self.data or {}).get("es_vlans", [])
+                                 if v.get("on_switch")} | {native})
+            data = {"port": [port], "vlanType": "1", "native": native, "permit": permit}
+        else:
+            data = {"port": [port], "vlanType": "0", "native": native, "permit": [native]}
+        known = {int(v["id"]) for v in (self.data or {}).get("es_vlans", []) if v.get("on_switch")}
+        for v in data["permit"]:
+            if v not in known and v != 1:
+                await self._esw_write("vlan_p.cgi?cmd=vlan_entry_add", {"vlanid": v})
+        await self._esw_write("vlan_p.cgi?cmd=vlan_setting_add", data)
+        await asyncio.sleep(1)
+        await self.async_request_refresh()
 
     async def async_es_poe(self, port, on):
         await self._esw_write("poe.cgi", {"portid": port, "mode": "1" if on else "0"})
@@ -1231,6 +1279,76 @@ class EsPoePower(_Base, SensorEntity):
             return None
 
 
+class EsPortVlan(_EsPort, SelectEntity):
+    """Access VLAN (access port) / native VLAN (trunk port) on an ES switch."""
+    _attr_icon = "mdi:lan"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coord, port):
+        super().__init__(coord, "vlan", port, f"Port {port + 1} VLAN")
+
+    def _label(self, vid):
+        for v in (self.coordinator.data or {}).get("es_vlans", []):
+            if v["id"] == str(vid):
+                return f"{v['id']} – {v['name']}"
+        return str(vid)
+
+    @property
+    def options(self):
+        opts = [self._label(v["id"]) for v in (self.coordinator.data or {}).get("es_vlans", [])]
+        cur = self.current_option
+        if cur and cur not in opts:
+            opts.append(cur)
+        return opts or ["1"]
+
+    @property
+    def current_option(self):
+        p = self._p()
+        return self._label(p.get("pvid")) if p and p.get("pvid") is not None else None
+
+    @property
+    def extra_state_attributes(self):
+        p = self._p() or {}
+        return {"mode": p.get("vlan_mode"), "allowed_vlans": p.get("vlans") or None,
+                "uplink": p.get("uplink")}
+
+    async def async_select_option(self, option):
+        await self.coordinator.async_es_set_vlan(self._port_id, vid=option.split(" ")[0])
+
+
+class EsPortVlanMode(_EsPort, SelectEntity):
+    _attr_icon = "mdi:lan-pending"
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_options = ["access", "trunk"]
+
+    def __init__(self, coord, port):
+        super().__init__(coord, "vlan_mode", port, f"Port {port + 1} VLAN Mode")
+
+    @property
+    def current_option(self):
+        return (self._p() or {}).get("vlan_mode")
+
+    async def async_select_option(self, option):
+        await self.coordinator.async_es_set_vlan(self._port_id, mode=option)
+
+
+class EsVlans(_Base, SensorEntity):
+    _attr_name = "VLANs"
+    _attr_icon = "mdi:lan"
+
+    def __init__(self, coord):
+        super().__init__(coord, "es_vlans")
+
+    @property
+    def native_value(self):
+        v = (self.coordinator.data or {}).get("es_vlans")
+        return len(v) if v else None
+
+    @property
+    def extra_state_attributes(self):
+        return {v["id"]: v["name"] for v in (self.coordinator.data or {}).get("es_vlans", [])}
+
+
 class EsReboot(_Base, ButtonEntity):
     _attr_name = "Reboot"
     _attr_icon = "mdi:restart"
@@ -1271,6 +1389,9 @@ async def async_setup_platform_for_switch(hass, entry, async_add_entities, platf
         elif platform == "switch":
             _es_per_port(coord, entry, async_add_entities, lambda n: [EsPortPoe(coord, n)],
                          poe_only=True)
+        elif platform == "select":
+            _es_per_port(coord, entry, async_add_entities,
+                         lambda n: [EsPortVlan(coord, n), EsPortVlanMode(coord, n)])
         elif platform == "button":
             async_add_entities([SwitchRefresh(coord), EsReboot(coord)])
             _es_per_port(coord, entry, async_add_entities,
@@ -1280,7 +1401,8 @@ async def async_setup_platform_for_switch(hass, entry, async_add_entities, platf
                                 EsPoePower(coord, "poe_max", "PoE Power Budget"),
                                 EsPoePower(coord, "poe_remaining", "PoE Power Remaining"),
                                 EsText(coord, "es_uplink", "Uplink Port", "mdi:arrow-up-network"),
-                                EsText(coord, "es_hostname", "Switch Name", "mdi:tag")])
+                                EsText(coord, "es_hostname", "Switch Name", "mdi:tag"),
+                                EsVlans(coord)])
             _es_per_port(coord, entry, async_add_entities,
                          lambda n: [EsPortPower(coord, n)], poe_only=True)
             _es_per_port(coord, entry, async_add_entities, lambda n: [
