@@ -9,6 +9,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
+from .ap_hub import setup_router_aps
 from .switch_hub import is_switch_entry, async_setup_platform_for_switch, setup_router_switches
 from .subentries import NETWORK, bind
 
@@ -32,6 +33,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
     if is_switch_entry(entry):
         return await async_setup_platform_for_switch(hass, entry, async_add_entities, "sensor")
     await setup_router_switches(hass, entry, async_add_entities, "sensor")
+    await setup_router_aps(hass, entry, async_add_entities, "sensor")
     async_add_entities = bind(entry, async_add_entities, NETWORK)
     coordinator = hass.data[DOMAIN][entry.entry_id]
     entities = [

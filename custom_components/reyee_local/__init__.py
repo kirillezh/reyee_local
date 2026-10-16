@@ -13,11 +13,14 @@ from .const import DOMAIN, PLATFORMS, CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from .api import ReyeeLocalAPI
 from .coordinator import ReyeeCoordinator
 from .diagnostics_probe import run_deep_probe
+from .ap_discovery import run_ap_scan
 from .subentries import (NETWORK, SWITCHES, ensure_subentries, migrate_devices, subentry_id,
                          switch_records, set_switch_records, _current_subentries)
 from .switch_hub import (SwitchCoordinator, SWITCH_PLATFORMS, is_switch_entry,
                          gateway_knows_switch, make_record, is_es_model)
 from homeassistant.helpers import entity_registry as er
+from .ap_hub import APCoordinator
+from .subentries import ap_records
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -106,6 +109,28 @@ async def _async_setup_router_switches(hass, entry, coordinator):
         hass.data[DOMAIN][_switch_store_key(entry, host)] = sc
     await asyncio.gather(*(sc.async_refresh() for sc in coordinator.switch_coords.values()),
                          return_exceptions=True)
+
+
+async def _async_setup_router_aps(hass, entry, coordinator):
+    """One APCoordinator per AP in the router's "Access Points" group."""
+    coordinator.ap_coords = {}
+    recs = ap_records(entry)
+    for rec in recs:
+        if not rec.get(CONF_HOST) or not rec.get("sn"):
+            continue
+        ac = APCoordinator(hass, entry, rec)
+        coordinator.ap_coords[rec[CONF_HOST]] = ac
+    if coordinator.ap_coords:
+        await asyncio.gather(*(ac.async_refresh() for ac in coordinator.ap_coords.values()),
+                             return_exceptions=True)
+    # entities of APs removed from the group
+    keep = {r.get("uid") for r in recs}
+    prefix = f"{entry.entry_id}_ap_"
+    reg = er.async_get(hass)
+    for ent in er.async_entries_for_config_entry(reg, entry.entry_id):
+        uid = ent.unique_id or ""
+        if uid.startswith(prefix) and not any(uid.startswith(k + "_") for k in keep if k):
+            reg.async_remove(ent.entity_id)
 
 
 def _cleanup_switch_devices(hass, entry, coordinator):
@@ -258,6 +283,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Switches added with "+ Add switch" (the "Switches" group)
     await _async_setup_router_switches(hass, entry, coordinator)
+    # Access points added with "+ Add AP" (the "Access Points" group)
+    await _async_setup_router_aps(hass, entry, coordinator)
     _cleanup_switch_devices(hass, entry, coordinator)
 
     # ── Services ─────────────────────────────────────────────────────────
@@ -268,6 +295,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _deep_probe(call: ServiceCall):
         for coord in _coords():
             await run_deep_probe(hass, coord)
+
+    async def _scan_aps(call: ServiceCall):
+        for coord in _coords():
+            hass.async_create_task(run_ap_scan(hass, coord))
 
     async def _set_primary_wan(call: ServiceCall):
         ifname = call.data["ifname"]
@@ -318,6 +349,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if not hass.services.has_service(DOMAIN, "deep_probe"):
         hass.services.async_register(DOMAIN, "deep_probe", _deep_probe)
+        hass.services.async_register(DOMAIN, "scan_access_points", _scan_aps)
         hass.services.async_register(
             DOMAIN, "set_primary_wan", _set_primary_wan,
             schema=vol.Schema({vol.Required("ifname"): cv.string}),
@@ -388,7 +420,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for host in (getattr(coord, "switch_coords", None) or {}):
             hass.data[DOMAIN].pop(_switch_store_key(entry, host), None)
         if not any(isinstance(c, ReyeeCoordinator) for c in hass.data[DOMAIN].values()):
-            for svc in ("deep_probe", "set_primary_wan", "set_forced_switch",
+            for svc in ("deep_probe", "scan_access_points", "set_primary_wan", "set_forced_switch",
                         "add_port_forward", "remove_port_forward", "set_ssid",
                         "block_device", "unblock_device", "set_rate_limit"):
                 hass.services.async_remove(DOMAIN, svc)

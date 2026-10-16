@@ -10,7 +10,7 @@
 
 No cloud • No subscriptions • Direct LAN communication
 
-[![Version](https://img.shields.io/badge/version-v1.25.1-2ea44f?style=for-the-badge)]()
+[![Version](https://img.shields.io/badge/version-v1.27.0-2ea44f?style=for-the-badge)]()
 [![Home Assistant](https://img.shields.io/badge/Home_Assistant-Compatible-41BDF5?style=for-the-badge&logo=homeassistant)]()
 [![HACS](https://img.shields.io/badge/HACS-Custom-orange?style=for-the-badge)](https://github.com/hacs/integration)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)]()
@@ -89,6 +89,7 @@ Control almost everything directly from Home Assistant.
 
 - 🔄 Refresh Router
 - 🔍 Deep API Probe
+- 📡 Scan Access Points (read-only, writes `/config/reyee_aps.json`)
 
 ---
 
@@ -182,6 +183,24 @@ router**, so they can be added even though a direct login to them fails.
 
 ---
 
+# 📶 Access Points
+
+Add APs the same way, with **+ Add AP** on the router entry. Tick the APs from
+the list the router has found; no password is needed (they're read through the
+router). Each AP's device page in the **Access Points** group then gets:
+
+| Sensor | |
+|---|---|
+| 👥 Clients (total, plus per 2.4G / 5G), with the client list as an attribute | ✅ |
+| 📡 Channel per radio (frequency and bandwidth as attributes) | ✅ |
+| 📊 Channel Busy % per radio | ✅ |
+| 📶 Weakest Client Signal (dBm, and which client) | ✅ |
+| ⬆⬇ Data Sent / Data Received | ✅ |
+| 🔌 Uplink Speed, TX Power, Noise Floor, Firmware (diagnostic) | ✅ |
+
+To remove an AP, open the **Access Points** group's ⋮ menu → **Reconfigure**.
+Tested on RAP2200(E).
+
 # 🖥 Supported Hardware
 
 ## Tested Hardware
@@ -202,6 +221,7 @@ router**, so they can be added even though a direct login to them fails.
 | RG-ES210GS-P              | PoE switch (8+2 SFP)  | ✅ Supported         |
 | RG-ES208GC                | Switch (8, no PoE)    | ✅ Supported         |
 | RG-ES206GS-P              | PoE switch (4+2)      | ✅ Supported         |
+| RAP2200(E)                | Access point          | ✅ Tested            |
 | Other ReyeeOS devices     |                       | ⚠️ Expected to work |
 
 
@@ -292,6 +312,7 @@ Restart Home Assistant.
 | `add_port_forward` | Create Port Forward |
 | `remove_port_forward` | Delete Port Forward |
 | `deep_probe` | Advanced API Diagnostics |
+| `scan_access_points` | Read-only AP scan → `/config/reyee_aps.json` |
 | `set_port_description` | Switch — set port description |
 | `set_port_vlan` | Switch — set port VLAN (access / trunk / hybrid) |
 | `set_port_isolation` | Switch — port isolation on/off |

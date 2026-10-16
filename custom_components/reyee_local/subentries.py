@@ -91,6 +91,24 @@ def set_switch_records(hass, entry, records):
     return True
 
 
+def ap_records(entry):
+    """APs added to this router entry (the Access Points group)."""
+    sid = subentry_id(entry, APS)
+    if not sid:
+        return []
+    return [dict(r) for r in (entry.subentries[sid].data.get("aps") or [])]
+
+
+def set_ap_records(hass, entry, records):
+    sid = subentry_id(entry, APS)
+    if not sid:
+        return False
+    sub = entry.subentries[sid]
+    hass.config_entries.async_update_subentry(
+        entry, sub, data={**dict(sub.data), "aps": list(records)})
+    return True
+
+
 def bind(entry, async_add_entities, kind):
     """Wrap a platform's async_add_entities so entities land in a group."""
     sid = subentry_id(entry, kind)

@@ -13,7 +13,9 @@ from .const import (DOMAIN, CONF_HOST, CONF_USERNAME, CONF_PASSWORD,
 from .api import ReyeeLocalAPI, ReyeeAuthError, ReyeeConnError
 from .switch_hub import (KIND_SWITCH, gateway_knows_switch, is_es_model, probe_direct,
                          is_switch_entry, switch_candidates, check_switch, make_record)
-from .subentries import SWITCHES, subentry_id, switch_records, set_switch_records
+from .subentries import (SWITCHES, APS, subentry_id, switch_records, set_switch_records,
+                         ap_records, set_ap_records)
+from .ap_hub import ap_candidates, make_ap_record
 
 try:
     from homeassistant.config_entries import ConfigSubentryFlow
@@ -113,7 +115,7 @@ class ReyeeLocalConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def async_get_supported_subentry_types(cls, config_entry):
         if ConfigSubentryFlow is None or is_switch_entry(config_entry):
             return {}
-        return {SWITCHES: ReyeeSwitchSubentryFlow}
+        return {SWITCHES: ReyeeSwitchSubentryFlow, APS: ReyeeApSubentryFlow}
 
 
 class ReyeeSwitchSubentryFlow(ConfigSubentryFlow or object):
@@ -200,4 +202,52 @@ class ReyeeOptionsFlow(config_entries.OptionsFlow):
                     int, vol.Range(min=10, max=300)
                 ),
             }),
+        )
+
+
+class ReyeeApSubentryFlow(ConfigSubentryFlow or object):
+    """ "+ Add AP" on the router entry: pick one of the router's access points.
+    APs are read through the router, so no password is asked."""
+
+    async def async_step_user(self, user_input=None):
+        entry = self._get_entry()
+        if not subentry_id(entry, APS):
+            return self.async_abort(reason="no_group")
+        have = {r.get(CONF_HOST) for r in ap_records(entry)}
+        found = {ip: v for ip, v in ap_candidates(self.hass, entry).items() if ip not in have}
+        if not found:
+            return self.async_abort(reason="no_new_aps")
+        if user_input is not None:
+            picked = [ip for ip in (user_input.get("aps") or []) if ip in found]
+            if picked:
+                recs = ap_records(entry) + [make_ap_record(entry, ip, found[ip]) for ip in picked]
+                set_ap_records(self.hass, entry, recs)      # reloads the router entry
+                return self.async_abort(reason="ap_added",
+                                        description_placeholders={"count": str(len(picked))})
+        options = [SelectOptionDict(value=ip, label=v["label"]) for ip, v in found.items()]
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema({
+                vol.Required("aps", default=list(found)): SelectSelector(SelectSelectorConfig(
+                    options=options, multiple=True, mode=SelectSelectorMode.LIST)),
+            }),
+            description_placeholders={"router": entry.data.get(CONF_HOST, ""),
+                                      "count": str(len(found))},
+        )
+
+    async def async_step_reconfigure(self, user_input=None):
+        """Remove APs from the group."""
+        entry = self._get_entry()
+        recs = ap_records(entry)
+        if not recs:
+            return self.async_abort(reason="no_aps")
+        labels = {r[CONF_HOST]: f"{r.get('name') or r.get('sn')} ({r[CONF_HOST]})" for r in recs}
+        if user_input is not None:
+            drop = set(user_input.get("remove") or [])
+            if drop:
+                set_ap_records(self.hass, entry, [r for r in recs if r[CONF_HOST] not in drop])
+            return self.async_abort(reason="reconfigure_successful")
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=vol.Schema({vol.Optional("remove", default=[]): cv.multi_select(labels)}),
         )
