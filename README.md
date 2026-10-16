@@ -10,7 +10,7 @@
 
 No cloud • No subscriptions • Direct LAN communication
 
-[![Version](https://img.shields.io/badge/version-v1.27.0-2ea44f?style=for-the-badge)]()
+[![Version](https://img.shields.io/badge/version-v1.17.0-2ea44f?style=for-the-badge)]()
 [![Home Assistant](https://img.shields.io/badge/Home_Assistant-Compatible-41BDF5?style=for-the-badge&logo=homeassistant)]()
 [![HACS](https://img.shields.io/badge/HACS-Custom-orange?style=for-the-badge)](https://github.com/hacs/integration)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)]()
@@ -89,7 +89,6 @@ Control almost everything directly from Home Assistant.
 
 - 🔄 Refresh Router
 - 🔍 Deep API Probe
-- 📡 Scan Access Points (read-only, writes `/config/reyee_aps.json`)
 
 ---
 
@@ -312,7 +311,6 @@ Restart Home Assistant.
 | `add_port_forward` | Create Port Forward |
 | `remove_port_forward` | Delete Port Forward |
 | `deep_probe` | Advanced API Diagnostics |
-| `scan_access_points` | Read-only AP scan → `/config/reyee_aps.json` |
 | `set_port_description` | Switch — set port description |
 | `set_port_vlan` | Switch — set port VLAN (access / trunk / hybrid) |
 | `set_port_isolation` | Switch — port isolation on/off |
