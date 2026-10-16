@@ -7,7 +7,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .switch_hub import is_switch_entry, async_setup_platform_for_switch
+from .switch_hub import is_switch_entry, async_setup_platform_for_switch, setup_router_switches
 from .subentries import NETWORK, bind
 from .coordinator import FEATURES
 
@@ -17,6 +17,7 @@ _LOGGER = logging.getLogger(__name__)
 async def async_setup_entry(hass, entry, async_add_entities):
     if is_switch_entry(entry):
         return await async_setup_platform_for_switch(hass, entry, async_add_entities, "switch")
+    await setup_router_switches(hass, entry, async_add_entities, "switch")
     async_add_entities = bind(entry, async_add_entities, NETWORK)
     coordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([

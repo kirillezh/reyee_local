@@ -1,3 +1,9 @@
+scan_access_points:
+  name: Scan access points
+  description: >
+    Read-only scan of every access point the router knows, to see what can be
+    added for APs. Writes /config/reyee_aps.json and shows a notification.
+
 deep_probe:
   name: Deep network probe
   description: >

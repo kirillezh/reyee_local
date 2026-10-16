@@ -1,4 +1,4 @@
-"""Buttons — force a refresh, run the deep probe."""
+"""Buttons — force a refresh, run the deep probe, scan the access points."""
 import logging
 
 from homeassistant.components.button import ButtonEntity
@@ -6,9 +6,11 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .switch_hub import is_switch_entry, async_setup_platform_for_switch
+from .ap_hub import setup_router_aps
+from .switch_hub import is_switch_entry, async_setup_platform_for_switch, setup_router_switches
 from .subentries import NETWORK, bind
 from .diagnostics_probe import run_deep_probe
+from .ap_discovery import run_ap_scan
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,11 +27,14 @@ def _dev(entry):
 async def async_setup_entry(hass, entry, async_add_entities):
     if is_switch_entry(entry):
         return await async_setup_platform_for_switch(hass, entry, async_add_entities, "button")
+    await setup_router_switches(hass, entry, async_add_entities, "button")
+    await setup_router_aps(hass, entry, async_add_entities, "button")
     async_add_entities = bind(entry, async_add_entities, NETWORK)
     coordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([
         ReyeeRefreshButton(coordinator, entry),
         ReyeeProbeButton(coordinator, entry),
+        ReyeeScanApsButton(coordinator, entry),
     ])
 
 
@@ -58,3 +63,17 @@ class ReyeeProbeButton(CoordinatorEntity, ButtonEntity):
 
     async def async_press(self):
         await run_deep_probe(self.hass, self.coordinator)
+
+
+class ReyeeScanApsButton(CoordinatorEntity, ButtonEntity):
+    """Read-only scan of every access point → /config/reyee_aps.json."""
+    _attr_name = "Reyee Scan Access Points"
+    _attr_icon = "mdi:access-point-network"
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_scan_aps"
+        self._attr_device_info = _dev(entry)
+
+    async def async_press(self):
+        self.hass.async_create_task(run_ap_scan(self.hass, self.coordinator))

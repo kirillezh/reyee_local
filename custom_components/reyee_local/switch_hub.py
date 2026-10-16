@@ -133,14 +133,96 @@ async def probe_direct(api):
     return None if _bad(r) or not isinstance(r, dict) else r
 
 
+# ── switches inside the router entry ("Switches" group) ─────────────────
+def switch_candidates(hass, entry):
+    """Switches this router has found: {ip: {model, sn, label}}."""
+    from .coordinator import is_switch_model
+    gw = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    out = {}
+    if gw is None or not hasattr(gw, "_slow"):
+        return out
+    for n in (gw.data or {}).get("topology", []):
+        if n.get("ip") and is_switch_model(n.get("model"), n.get("type")):
+            out[n["ip"]] = {"model": n.get("model"), "sn": n.get("sn")}
+    for n in gw._slow.get("neighbors", []):
+        if n.get("ip") and (n.get("is_switch") or is_switch_model(n.get("model"), n.get("role"))):
+            cur = out.setdefault(n["ip"], {})
+            cur["model"] = cur.get("model") or n.get("model")
+            cur["sn"] = cur.get("sn") or n.get("sn")
+    for ip, v in out.items():
+        kind = "PoE" if is_es_model(v.get("model")) else "managed"
+        v["label"] = f"{ip} · {v.get('model') or 'Switch'} ({kind})"
+    return dict(sorted(out.items(), key=lambda kv: tuple(
+        int(x) if x.isdigit() else 0 for x in kv[0].split("."))))
+
+
+async def check_switch(hass, entry, host, username, password):
+    """Can we manage `host`? → (ok, model, sn)."""
+    from homeassistant.helpers.aiohttp_client import async_get_clientsession
+    from .api import ReyeeLocalAPI
+    node = gateway_knows_switch(hass, host) or switch_candidates(hass, entry).get(host) or {}
+    if node and is_es_model(node.get("model")):
+        return True, node.get("model"), node.get("sn")      # via the router
+    api = ReyeeLocalAPI(host=host, password=password, username=username or "admin",
+                        session=async_get_clientsession(hass))
+    info = None
+    try:
+        await asyncio.wait_for(api.login(), 10)
+        info = await probe_direct(api)
+    except Exception:  # noqa: BLE001
+        info = None
+    if info:
+        return True, info.get("model") or node.get("model"), info.get("serial_num") or node.get("sn")
+    if node:
+        return True, node.get("model"), node.get("sn")      # relayed by the router
+    return False, None, None
+
+
+def make_record(entry, host, username, password, model, sn, key=None, title=None):
+    return {
+        CONF_HOST: host,
+        "username": username or "admin",
+        "password": password or "",
+        "model": model,
+        "sn": sn,
+        "key": key or f"{entry.entry_id}_sw_{host}",
+        "title": title or f"{host} Reyee {model or 'Switch'}",
+    }
+
+
+async def setup_router_switches(hass, entry, raw_add, platform):
+    """Add the entities of every switch in the router's Switches group."""
+    from .subentries import SWITCHES, bind
+    gw = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+    coords = getattr(gw, "switch_coords", None) or {}
+    if not coords:
+        return
+    add = bind(entry, raw_add, SWITCHES)
+    for coord in coords.values():
+        if platform not in SWITCH_PLATFORMS:
+            continue
+        try:
+            await async_setup_platform_for_switch(hass, entry, add, platform, coord)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Reyee: switch %s %s setup failed: %s", coord.host, platform, err)
+
+
 class SwitchCoordinator(DataUpdateCoordinator):
-    def __init__(self, hass, entry, api):
+    def __init__(self, hass, entry, api, record=None):
+        """entry: the switch's own entry (legacy) or the router entry.
+        record: the switch's row in the router's "Switches" group."""
         interval = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
         super().__init__(hass, logger=_LOGGER, name=f"{DOMAIN}_switch",
                          update_interval=timedelta(seconds=interval))
         self.entry = entry
         self.api = api                  # direct API to the switch
-        self.host = entry.data[CONF_HOST]
+        self.record = record or {}
+        self.host = self.record.get(CONF_HOST) or entry.data[CONF_HOST]
+        # key → unique ids + device identifier (kept stable across the move
+        # from a standalone entry into the router's Switches group)
+        self.key = self.record.get("key") or entry.entry_id
+        self.title = self.record.get("title") or entry.title
+        self.gw_entry_id = entry.entry_id if record else None
         self.mode = None                # "direct" | "relay"
         self.sysinfo = {}
         self._desc = {}
@@ -150,6 +232,9 @@ class SwitchCoordinator(DataUpdateCoordinator):
 
     # ── transport ────────────────────────────────────────────────────────
     def _gateway(self):
+        own = self.hass.data.get(DOMAIN, {}).get(self.gw_entry_id) if self.gw_entry_id else None
+        if own is not None and hasattr(own, "_slow"):
+            return own
         gws = gateway_coordinators(self.hass)
         for gw in gws:
             if any(n.get("ip") == self.host for n in gw._slow.get("neighbors", [])):
@@ -343,7 +428,8 @@ class SwitchCoordinator(DataUpdateCoordinator):
     }
 
     def _es_sn(self):
-        return (gateway_knows_switch(self.hass, self.host) or {}).get("sn")
+        return ((gateway_knows_switch(self.hass, self.host) or {}).get("sn")
+                or self.record.get("sn"))
 
     async def _esw(self, url, method="get", data=None):
         """One doSwitchApi call through the gateway. Returns (ok, payload)."""
@@ -599,7 +685,7 @@ class SwitchCoordinator(DataUpdateCoordinator):
 
     async def _pick_mode(self):
         node = gateway_knows_switch(self.hass, self.host) or {}
-        if is_es_model(node.get("model")):
+        if is_es_model(node.get("model") or self.record.get("model")):
             self.mode = "es"
             return
         info = await probe_direct(self.api)
@@ -774,9 +860,9 @@ class SwitchCoordinator(DataUpdateCoordinator):
 def _device(coord):
     d = coord.data or {}
     return DeviceInfo(
-        identifiers={(DOMAIN, coord.entry.entry_id)},
+        identifiers={(DOMAIN, coord.key)},
         manufacturer="Ruijie",
-        name=coord.entry.title,
+        name=coord.title,
         model=d.get("model"),
         sw_version=d.get("firmware"),
         serial_number=d.get("serial"),
@@ -789,7 +875,7 @@ class _Base(CoordinatorEntity):
 
     def __init__(self, coord, key):
         super().__init__(coord)
-        self._attr_unique_id = f"{coord.entry.entry_id}_{key}"
+        self._attr_unique_id = f"{coord.key}_{key}"
         self._attr_device_info = _device(coord)
 
 
@@ -1405,8 +1491,8 @@ def _es_per_port(coord, entry, async_add_entities, factory, poe_only=False):
     entry.async_on_unload(coord.async_add_listener(_add))
 
 
-async def async_setup_platform_for_switch(hass, entry, async_add_entities, platform):
-    coord = hass.data[DOMAIN][entry.entry_id]
+async def async_setup_platform_for_switch(hass, entry, async_add_entities, platform, coord=None):
+    coord = coord or hass.data[DOMAIN][entry.entry_id]
     if coord.mode == "es":
         # ES-series PoE switches: their own feature set (ports + PoE), read and
         # controlled through the router's /api/switch relay.
