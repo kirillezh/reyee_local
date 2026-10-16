@@ -8,7 +8,7 @@
 
 **Complete local control for Ruijie Reyee Gateways, managed switches and PoE switches**
 
-No cloud • No subscriptions • Direct LAN communication
+No cloud • No subscriptions • Direct LAN communication. 
 
 [![Version](https://img.shields.io/badge/version-v1.17.0-2ea44f?style=for-the-badge)]()
 [![Home Assistant](https://img.shields.io/badge/Home_Assistant-Compatible-41BDF5?style=for-the-badge&logo=homeassistant)]()
