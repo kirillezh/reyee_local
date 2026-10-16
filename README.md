@@ -6,7 +6,7 @@
 
 <p align="center">
 
-**Complete local control for Ruijie Reyee EG Series Gateways, managed switches and PoE switches**
+**Complete local control for Ruijie Reyee Gateways, managed switches and PoE switches**
 
 No cloud • No subscriptions • Direct LAN communication
 
