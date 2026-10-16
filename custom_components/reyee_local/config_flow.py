@@ -4,6 +4,9 @@ from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.selector import (
+    SelectOptionDict, SelectSelector, SelectSelectorConfig, SelectSelectorMode,
+    TextSelector, TextSelectorConfig, TextSelectorType)
 
 from .const import (DOMAIN, CONF_HOST, CONF_USERNAME, CONF_PASSWORD,
                     CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
@@ -126,9 +129,10 @@ class ReyeeSwitchSubentryFlow(ConfigSubentryFlow or object):
                  if ip not in have}
         errors = {}
         if user_input is not None:
-            host = user_input.get("switch")
-            if host == _OTHER or not host:
-                host = (user_input.get(CONF_HOST) or "").strip()
+            host = str(user_input.get("switch") or "").strip()
+            if host == _OTHER:
+                host = ""
+            host = host.split(" ", 1)[0]          # "192.168.88.14 · RG-ES…" → IP
             if not host:
                 errors["base"] = "need_host"
             elif host in have:
@@ -148,15 +152,17 @@ class ReyeeSwitchSubentryFlow(ConfigSubentryFlow or object):
                     return self.async_abort(reason="switch_added",
                                             description_placeholders={"host": host})
 
-        options = {ip: v["label"] for ip, v in found.items()}
-        options[_OTHER] = "Other IP…"
+        options = [SelectOptionDict(value=ip, label=v["label"]) for ip, v in found.items()]
+        first = options[0]["value"] if options else vol.UNDEFINED
         return self.async_show_form(
             step_id="user",
             data_schema=vol.Schema({
-                vol.Required("switch", default=next(iter(options))): vol.In(options),
-                vol.Optional(CONF_HOST, default=""): str,
-                vol.Optional(CONF_USERNAME, default="admin"): str,
-                vol.Optional(CONF_PASSWORD, default=""): str,
+                # dropdown of found switches; you can also type any IP into it
+                vol.Required("switch", default=first): SelectSelector(SelectSelectorConfig(
+                    options=options, mode=SelectSelectorMode.DROPDOWN, custom_value=True)),
+                vol.Optional(CONF_USERNAME, default="admin"): TextSelector(),
+                vol.Optional(CONF_PASSWORD, default=""): TextSelector(
+                    TextSelectorConfig(type=TextSelectorType.PASSWORD)),
             }),
             errors=errors,
             description_placeholders={"router": entry.data.get(CONF_HOST, ""),

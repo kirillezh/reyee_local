@@ -44,10 +44,9 @@
       "step": {
         "user": {
           "title": "Add switch",
-          "description": "{count} switch(es) found by the router {router}. Pick one, or choose Other IP and type it. ES PoE switches don't need a password (they're managed through the router). Leave the password empty to use the router's.",
+          "description": "{count} switch(es) found by the router {router}. Pick one from the list, or type an IP into the box. ES PoE switches don't need a password (they're managed through the router). Leave the password empty to use the router's.",
           "data": {
-            "switch": "Switch",
-            "host": "Other IP (only if Other IP… is picked)",
+            "switch": "Switch (pick one or type an IP)",
             "username": "Username",
             "password": "Password (optional)"
           }

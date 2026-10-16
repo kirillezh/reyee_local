@@ -10,7 +10,7 @@
 
 No cloud • No subscriptions • Direct LAN communication
 
-[![Version](https://img.shields.io/badge/version-v1.25.0-2ea44f?style=for-the-badge)]()
+[![Version](https://img.shields.io/badge/version-v1.25.1-2ea44f?style=for-the-badge)]()
 [![Home Assistant](https://img.shields.io/badge/Home_Assistant-Compatible-41BDF5?style=for-the-badge&logo=homeassistant)]()
 [![HACS](https://img.shields.io/badge/HACS-Custom-orange?style=for-the-badge)](https://github.com/hacs/integration)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)]()
@@ -101,7 +101,7 @@ Settings
 → Devices & Services
 → Ruijie Reyee (Local)
 → + Add switch (on the router entry)
-→ pick the switch from the list (or Other IP…)
+→ pick the switch from the list (or type its IP)
 ```
 
 The list shows the switches your router has already found. ES PoE switches
