@@ -1,4 +1,5 @@
 """Ruijie Reyee (Local) integration."""
+import asyncio
 import logging
 
 import voluptuous as vol
@@ -12,8 +13,11 @@ from .const import DOMAIN, PLATFORMS, CONF_HOST, CONF_PASSWORD, CONF_USERNAME
 from .api import ReyeeLocalAPI
 from .coordinator import ReyeeCoordinator
 from .diagnostics_probe import run_deep_probe
-from .subentries import NETWORK, ensure_subentries, migrate_devices, subentry_id
-from .switch_hub import SwitchCoordinator, SWITCH_PLATFORMS, is_switch_entry
+from .subentries import (NETWORK, SWITCHES, ensure_subentries, migrate_devices, subentry_id,
+                         switch_records, set_switch_records, _current_subentries)
+from .switch_hub import (SwitchCoordinator, SWITCH_PLATFORMS, is_switch_entry,
+                         gateway_knows_switch, make_record, is_es_model)
+from homeassistant.helpers import entity_registry as er
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -74,6 +78,110 @@ def _register_switch_services(hass):
         vol.Optional("out_kbps", default=0): vol.Coerce(int)}))
 
 
+def _switch_store_key(entry, host):
+    return f"{entry.entry_id}::switch::{host}"
+
+
+async def _async_setup_router_switches(hass, entry, coordinator):
+    """One SwitchCoordinator per switch in the router's "Switches" group."""
+    coordinator.switch_coords = {}
+    recs = switch_records(entry)
+    if not recs:
+        return
+    _register_switch_services(hass)
+    for rec in recs:
+        host = rec.get(CONF_HOST)
+        if not host:
+            continue
+        api = ReyeeLocalAPI(
+            host=host,
+            password=rec.get(CONF_PASSWORD) or entry.data.get(CONF_PASSWORD, ""),
+            username=rec.get(CONF_USERNAME) or "admin",
+            session=async_get_clientsession(hass),
+        )
+        sc = SwitchCoordinator(hass, entry, api, rec)
+        if is_es_model(rec.get("model")):
+            sc.mode = "es"
+        coordinator.switch_coords[host] = sc
+        hass.data[DOMAIN][_switch_store_key(entry, host)] = sc
+    await asyncio.gather(*(sc.async_refresh() for sc in coordinator.switch_coords.values()),
+                         return_exceptions=True)
+
+
+def _cleanup_switch_devices(hass, entry, coordinator):
+    """Drop devices of switches removed from the group, and the router's own
+    basic copy of a switch that is now added properly (no duplicates)."""
+    registry = dr.async_get(hass)
+    sid = subentry_id(entry, SWITCHES)
+    recs = switch_records(entry)
+    keys = {r.get("key") for r in recs}
+    hosts = {r.get(CONF_HOST) for r in recs}
+    infra = set()
+    for n in (coordinator.data or {}).get("topology", []):
+        if n.get("ip") in hosts:
+            k = n.get("sn") or n.get("mac") or n.get("name")
+            if k:
+                infra.add(f"{entry.entry_id}_infra_{k}")
+    infra |= {f"{entry.entry_id}_infra_{r['sn']}" for r in recs if r.get("sn")}
+    for device in dr.async_entries_for_config_entry(registry, entry.entry_id):
+        ours = {i[1] for i in device.identifiers if i[0] == DOMAIN}
+        if not ours:
+            continue
+        drop = bool(ours & infra)
+        if not drop and sid and sid in _current_subentries(device, entry.entry_id):
+            drop = not any("_infra_" in o or o in keys or o == entry.entry_id for o in ours)
+        if drop:
+            try:
+                registry.async_remove_device(device.id)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Reyee: could not remove device %s: %s", device.id, err)
+
+
+async def _absorb_legacy_switches(hass, entry):
+    """Move switches that were added as their own hub entry into this router's
+    Switches group — same entity ids, no re-adding needed."""
+    sid = subentry_id(entry, SWITCHES)
+    legacy = [e for e in hass.config_entries.async_entries(DOMAIN) if is_switch_entry(e)]
+    if not sid or not legacy:
+        return
+    ent_reg = er.async_get(hass)
+    dev_reg = dr.async_get(hass)
+    recs = switch_records(entry)
+    for old in legacy:
+        host = old.data.get(CONF_HOST)
+        if any(r.get(CONF_HOST) == host for r in recs):
+            await hass.config_entries.async_remove(old.entry_id)
+            continue
+        node = gateway_knows_switch(hass, host) or {}
+        model = node.get("model") or (old.title.split(" Reyee ", 1)[1]
+                                      if " Reyee " in old.title else None)
+        recs.append(make_record(entry, host, old.data.get(CONF_USERNAME, "admin"),
+                                old.data.get(CONF_PASSWORD, ""), model, node.get("sn"),
+                                key=old.entry_id, title=old.title))
+        for ent in er.async_entries_for_config_entry(ent_reg, old.entry_id):
+            try:
+                ent_reg.async_update_entity(ent.entity_id, config_entry_id=entry.entry_id,
+                                            config_subentry_id=sid)
+            except TypeError:
+                ent_reg.async_update_entity(ent.entity_id, config_entry_id=entry.entry_id)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Reyee: could not move %s: %s", ent.entity_id, err)
+        for dev in dr.async_entries_for_config_entry(dev_reg, old.entry_id):
+            try:
+                try:
+                    dev_reg.async_update_device(dev.id, new_config_entry_id=entry.entry_id,
+                                                new_config_subentry_id=sid)
+                except TypeError:
+                    dev_reg.async_update_device(dev.id, add_config_entry_id=entry.entry_id,
+                                                add_config_subentry_id=sid)
+                    dev_reg.async_update_device(dev.id, remove_config_entry_id=old.entry_id)
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Reyee: could not move device %s: %s", dev.id, err)
+        await hass.config_entries.async_remove(old.entry_id)
+        _LOGGER.info("Reyee: moved switch %s into the router's Switches group", host)
+    set_switch_records(hass, entry, recs)        # → reloads this entry
+
+
 async def _async_setup_switch(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """A managed switch added as its own hub entry."""
     api = ReyeeLocalAPI(
@@ -101,8 +209,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         session=async_get_clientsession(hass),
     )
 
-    # Two collapsible groups on the integration page (HA 2025.3+):
-    # "Reyee Network" (gateway/APs/switches) and "Connected Devices" (clients).
+    # Collapsible groups on the integration page (HA 2025.3+):
+    # Router / Switches / Access Points / Connected Devices.
     ensure_subentries(hass, entry)
     migrate_devices(hass, entry)
 
@@ -147,6 +255,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    # Switches added with "+ Add switch" (the "Switches" group)
+    await _async_setup_router_switches(hass, entry, coordinator)
+    _cleanup_switch_devices(hass, entry, coordinator)
 
     # ── Services ─────────────────────────────────────────────────────────
     def _coords():
@@ -258,6 +370,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    if any(is_switch_entry(e) for e in hass.config_entries.async_entries(DOMAIN)):
+        entry.async_create_background_task(
+            hass, _absorb_legacy_switches(hass, entry), "reyee_absorb_switches")
     return True
 
 
@@ -269,7 +384,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     platforms = SWITCH_PLATFORMS if is_switch_entry(entry) else PLATFORMS
     unloaded = await hass.config_entries.async_unload_platforms(entry, platforms)
     if unloaded:
-        hass.data[DOMAIN].pop(entry.entry_id, None)
+        coord = hass.data[DOMAIN].pop(entry.entry_id, None)
+        for host in (getattr(coord, "switch_coords", None) or {}):
+            hass.data[DOMAIN].pop(_switch_store_key(entry, host), None)
         if not any(isinstance(c, ReyeeCoordinator) for c in hass.data[DOMAIN].values()):
             for svc in ("deep_probe", "set_primary_wan", "set_forced_switch",
                         "add_port_forward", "remove_port_forward", "set_ssid",

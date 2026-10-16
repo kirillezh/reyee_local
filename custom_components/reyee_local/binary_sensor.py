@@ -8,8 +8,8 @@ from homeassistant.helpers.device_registry import DeviceInfo, CONNECTION_NETWORK
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .switch_hub import is_switch_entry, async_setup_platform_for_switch
-from .subentries import NETWORK, bind
+from .switch_hub import is_switch_entry, async_setup_platform_for_switch, setup_router_switches
+from .subentries import NETWORK, SWITCHES, APS, bind, switch_records
 from .coordinator import VPN_SERVERS
 
 _LOGGER = logging.getLogger(__name__)
@@ -24,6 +24,8 @@ _INFRA_TYPES = {
 async def async_setup_entry(hass, entry, async_add_entities):
     if is_switch_entry(entry):
         return await async_setup_platform_for_switch(hass, entry, async_add_entities, "binary_sensor")
+    await setup_router_switches(hass, entry, async_add_entities, "binary_sensor")
+    raw_add = async_add_entities
     async_add_entities = bind(entry, async_add_entities, NETWORK)
     coordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([ReyeeInternetOnline(coordinator, entry)])
@@ -32,17 +34,28 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     seen = set()
 
+    add_switch = bind(entry, raw_add, SWITCHES)
+    add_ap = bind(entry, raw_add, APS)
+    added = switch_records(entry)
+    added_ips = {r.get("host") for r in added}
+    added_sns = {r.get("sn") for r in added if r.get("sn")}
+
     def _add_infra():
-        new = []
+        sw, ap = [], []
         for n in (coordinator.data or {}).get("topology", []):
             if n.get("depth", 0) == 0:
                 continue  # skip the gateway itself
             sn = n.get("sn") or n.get("mac") or n.get("name")
             if sn and sn not in seen and n.get("type") in _INFRA_TYPES:
                 seen.add(sn)
-                new.append(ReyeeInfraDevice(coordinator, entry, sn))
-        if new:
-            async_add_entities(new)
+                if n.get("ip") in added_ips or sn in added_sns:
+                    continue  # added under Switches with its full controls
+                is_sw = _INFRA_TYPES[n["type"]] == "Switch"
+                (sw if is_sw else ap).append(ReyeeInfraDevice(coordinator, entry, sn))
+        if sw:
+            add_switch(sw)
+        if ap:
+            add_ap(ap)
 
     _add_infra()
 
@@ -57,7 +70,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
                     seen_ports.add(key)
                     new.append(ReyeeSwitchPort(coordinator, entry, sn, p.get("lpid")))
         if new:
-            async_add_entities(new)
+            add_switch(new)
 
     _add_ports()
     entry.async_on_unload(coordinator.async_add_listener(_add_ports))

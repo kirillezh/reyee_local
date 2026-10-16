@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Ruijie Reyee (Local)",
-        "description": "Connect to your Reyee gateway over the local network.",
+        "description": "Connect to your Reyee router (gateway). Add switches afterwards with **+ Add switch** on the router entry.",
         "data": {
           "host": "Host / IP address",
           "username": "Username",
@@ -17,7 +17,8 @@
       "unknown": "Unexpected error."
     },
     "abort": {
-      "already_configured": "This device is already configured."
+      "already_configured": "This device is already configured.",
+      "added_to_router": "That IP is a switch, so it was added to your router's Switches group instead of as a separate hub."
     }
   },
   "options": {
@@ -32,10 +33,50 @@
   },
   "config_subentries": {
     "network": {
-      "entry_type": "Router, access points & switches"
+      "entry_type": "Router"
+    },
+    "switches": {
+      "entry_type": "Switches",
+      "initiate_flow": {
+        "user": "Add switch",
+        "reconfigure": "Manage switches"
+      },
+      "step": {
+        "user": {
+          "title": "Add switch",
+          "description": "{count} switch(es) found by the router {router}. Pick one, or choose Other IP and type it. ES PoE switches don't need a password (they're managed through the router). Leave the password empty to use the router's.",
+          "data": {
+            "switch": "Switch",
+            "host": "Other IP (only if Other IP… is picked)",
+            "username": "Username",
+            "password": "Password (optional)"
+          }
+        },
+        "reconfigure": {
+          "title": "Manage switches",
+          "description": "Tick any switch to remove it from Home Assistant.",
+          "data": {
+            "remove": "Remove"
+          }
+        }
+      },
+      "error": {
+        "cannot_connect": "Couldn't reach that switch, and the router doesn't know it. Check the IP and password.",
+        "need_host": "Type the switch's IP address."
+      },
+      "abort": {
+        "switch_added": "Switch {host} added. It appears under Switches in a few seconds.",
+        "already_added": "That switch is already added.",
+        "no_group": "Restart Home Assistant once, then try again.",
+        "no_switches": "No switches added yet. Use Add switch.",
+        "reconfigure_successful": "Done."
+      }
+    },
+    "aps": {
+      "entry_type": "Access Points"
     },
     "clients": {
-      "entry_type": "Clients connected to the network"
+      "entry_type": "Connected Devices"
     }
   }
 }

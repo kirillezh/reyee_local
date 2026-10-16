@@ -632,6 +632,7 @@ class ReyeeCoordinator(DataUpdateCoordinator):
         out = {}
         own = {e.data.get("host") for e in self.hass.config_entries.async_entries(DOMAIN)
                if e.data.get("kind") == "switch"} if self.hass else set()
+        own |= set(getattr(self, "switch_coords", None) or {})
         for n in self._slow.get("neighbors", []):
             ip, sn = n.get("ip"), n.get("sn")
             if not (n.get("is_switch") and ip and sn) or ip in own:

@@ -1,6 +1,8 @@
-"""Split the integration page into two collapsible groups using config subentries.
+"""Split the integration page into collapsible groups using config subentries.
 
-  • "Reyee Network"      — gateway, access points, switches (+ all hub entities)
+  • "Router"             — the gateway (+ all hub entities)
+  • "Switches"           — managed / PoE switches (added with "+ Add switch")
+  • "Access Points"      — APs seen by the gateway
   • "Connected Devices"  — every client tracked on the network
 
 Needs Home Assistant 2025.3+ (config subentries). On older versions every helper
@@ -21,12 +23,17 @@ except ImportError:  # HA < 2025.3
     ConfigSubentry = None
 
 NETWORK = "network"
+SWITCHES = "switches"
+APS = "aps"
 CLIENTS = "clients"
 
 _TITLES = {
-    NETWORK: "Reyee Network",
+    NETWORK: "Router",
+    SWITCHES: "Switches",
+    APS: "Access Points",
     CLIENTS: "Connected Devices",
 }
+_OLD_TITLES = {NETWORK: ("Reyee Network",)}
 
 
 def subentry_id(entry, kind):
@@ -42,7 +49,14 @@ def ensure_subentries(hass, entry):
     if ConfigSubentry is None:
         return
     for kind, title in _TITLES.items():
-        if subentry_id(entry, kind):
+        sid = subentry_id(entry, kind)
+        if sid:
+            sub = entry.subentries[sid]
+            if sub.title in _OLD_TITLES.get(kind, ()):
+                try:
+                    hass.config_entries.async_update_subentry(entry, sub, title=title)
+                except Exception:  # noqa: BLE001
+                    pass
             continue
         try:
             hass.config_entries.async_add_subentry(
@@ -56,6 +70,25 @@ def ensure_subentries(hass, entry):
             )
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Reyee: could not create %s group: %s", kind, err)
+
+
+def switch_records(entry):
+    """Switches added to this router entry: list of dicts
+    {host, username, password, key, title, model, sn}."""
+    sid = subentry_id(entry, SWITCHES)
+    if not sid:
+        return []
+    return [dict(r) for r in (entry.subentries[sid].data.get("switches") or [])]
+
+
+def set_switch_records(hass, entry, records):
+    sid = subentry_id(entry, SWITCHES)
+    if not sid:
+        return False
+    sub = entry.subentries[sid]
+    hass.config_entries.async_update_subentry(
+        entry, sub, data={**dict(sub.data), "switches": list(records)})
+    return True
 
 
 def bind(entry, async_add_entities, kind):
@@ -93,20 +126,33 @@ def _move(registry, device, entry_id, target):
             device.id, remove_config_entry_id=entry_id, remove_config_subentry_id=old)
 
 
+def _group_for(entry, device, ids):
+    """Which group a device belongs in."""
+    from .coordinator import is_switch_model
+    ours = [i[1] for i in device.identifiers if i[0] == DOMAIN]
+    if not ours:
+        return ids[CLIENTS]
+    keys = {r.get("key") for r in switch_records(entry)}
+    for ident in ours:
+        if ident in keys or ident.startswith(f"{entry.entry_id}_sw_"):
+            return ids[SWITCHES]
+        if "_infra_" in ident:
+            return ids[SWITCHES] if is_switch_model(device.model, None) else ids[APS]
+    return ids[NETWORK]
+
+
 def migrate_devices(hass, entry):
     """Move existing devices into the right group (no delete/re-add needed).
 
     Our own devices (gateway, APs, switches) carry a DOMAIN identifier; client
     devices are created by HA's ScannerEntity from the MAC alone.
     """
-    net = subentry_id(entry, NETWORK)
-    clients = subentry_id(entry, CLIENTS)
-    if not net or not clients:
+    ids = {k: subentry_id(entry, k) for k in _TITLES}
+    if not all(ids.values()):
         return
     registry = dr.async_get(hass)
     for device in dr.async_entries_for_config_entry(registry, entry.entry_id):
-        ours = any(i[0] == DOMAIN for i in device.identifiers)
         try:
-            _move(registry, device, entry.entry_id, net if ours else clients)
+            _move(registry, device, entry.entry_id, _group_for(entry, device, ids))
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("Reyee: could not regroup device %s: %s", device.id, err)
